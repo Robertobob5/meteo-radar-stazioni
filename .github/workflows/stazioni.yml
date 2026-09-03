@@ -1,6 +1,6 @@
-# Meteo Radar · le stazioni vicine (v65)
+# Meteo Radar · le stazioni vicine (v65 · ponte 2)
 #
-# Ogni ora parte un giro lungo: interroga Netatmo e gli aeroporti tre volte
+# Ogni avvio è un giro lungo: interroga Netatmo e gli aeroporti tre volte
 # (subito, dopo 18 minuti, dopo 36) e pubblica le letture sul ramo "dati",
 # che contiene SEMPRE un solo commit: niente cronologia che cresce, e il
 # ramo principale (questo file, il programma) non viene mai toccato.
@@ -9,9 +9,14 @@
 # stanno nelle impostazioni del repository: nell'app non entra niente.
 # Il gettone rinnovato vive cifrato in stato/netatmo.enc sul ramo "dati".
 #
-# GitHub non garantisce gli avvii programmati (lo sappiamo dal blog): il
-# giro lungo fa sì che anche un avvio ogni tanto tenga le letture fresche,
-# e si può sempre chiamare da fuori con workflow_dispatch (cron-job.org).
+# PERCHÉ SI RILANCIA DA SOLO. GitHub non garantisce gli avvii programmati:
+# il 3 settembre ha saltato quelli delle 12:09 e delle 13:09, e l'app è
+# rimasta senza letture fresche. Perciò alla fine di ogni giro lungo il
+# workflow chiede a GitHub di farne partire un altro (workflow_dispatch):
+# la catena non dipende dall'orologio di GitHub. L'orario programmato resta
+# come rete di sicurezza: se la catena si spezza, la riannoda. Non si
+# raddoppia mai: prima di rilanciarsi si controlla che non ci sia già un
+# altro giro in coda o in corso.
 name: Stazioni vicine
 
 on:
@@ -21,6 +26,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: stazioni-vicine
@@ -45,9 +51,15 @@ jobs:
           if git fetch --depth 1 origin dati 2>/dev/null; then
             git show FETCH_HEAD:stato/netatmo.enc > stato/netatmo.enc 2>/dev/null || true
             git show FETCH_HEAD:mattonelle.json > mattonelle.json 2>/dev/null || true
+            git show FETCH_HEAD:aeroporti.json > aeroporti.json 2>/dev/null || true
             [ -s stato/netatmo.enc ] || rm -f stato/netatmo.enc
             [ -s mattonelle.json ] || rm -f mattonelle.json
-            echo "stato recuperato"
+            [ -s aeroporti.json ] || rm -f aeroporti.json
+            # le celle già pubblicate: servono a riportare le letture del giro
+            # prima dove Netatmo oggi non risponde
+            git checkout FETCH_HEAD -- celle 2>/dev/null || true
+            git reset -q -- celle 2>/dev/null || true
+            echo "stato recuperato ($(ls celle 2>/dev/null | wc -l) celle del giro prima)"
           else
             echo "primo giro: nessuno stato"
           fi
@@ -79,3 +91,21 @@ jobs:
             fi
             if [ "$giro" -lt 3 ]; then sleep 1080; fi
           done
+
+      - name: Rilancia il prossimo giro lungo
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          altri=0
+          for stato in queued waiting pending requested in_progress; do
+            n=$(gh run list --repo "${{ github.repository }}" --workflow "${{ github.workflow }}" --status "$stato" \
+                  --json databaseId --jq "[.[] | select(.databaseId != ${{ github.run_id }})] | length" 2>/dev/null || echo 0)
+            altri=$((altri + n))
+          done
+          if [ "$altri" -gt 0 ]; then
+            echo "c'è già un altro giro in coda o in corso ($altri): non mi rilancio"
+          else
+            gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
+            echo "prossimo giro chiesto a GitHub"
+          fi
