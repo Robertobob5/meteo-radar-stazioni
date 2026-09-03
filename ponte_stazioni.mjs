@@ -1,5 +1,5 @@
 /* ════════════════════════════════════════════════════════════════
-   Meteo Radar · il PONTE delle stazioni vicine (v65)
+   Meteo Radar · il PONTE delle stazioni vicine (v65 · ponte 2)
 
    Gira su GitHub, non nell'app. Ogni giro:
      1. rinnova il gettone Netatmo coi codici segreti (che restano su
@@ -19,6 +19,19 @@
 
    Limiti rispettati: Netatmo concede ~500 richieste l'ora per account.
    Qui il tetto è 150 chiamate a giro, con tre giri l'ora al massimo.
+
+   PONTE 2 (3 settembre 2026), imparato dal primo giro vero:
+   · Netatmo risponde 503 a sprazzi: ogni mattonella si ritenta fino a
+     tre volte con una pausa crescente, e ogni chiamata ha un tempo massimo.
+   · Netatmo restituisce stazioni anche ben fuori dal rettangolo chiesto
+     e, dove è denso, TAGLIA la risposta. Perciò si spezza una mattonella
+     contando le stazioni DENTRO il suo rettangolo (non quante ne arrivano),
+     e si scende fino a 0,25° nelle zone più fitte.
+   · L'albero delle mattonelle si ricorda da un giro all'altro: chi era da
+     spezzare non si richiede più, si va dritti alle sue foglie.
+   · Il rettangolo dell'Italia contiene Svizzera, Francia, Austria, Croazia
+     e Tunisia: le mattonelle che non toccano l'Italia (con 25 km di
+     margine, il raggio della carta) non si chiedono affatto.
    ════════════════════════════════════════════════════════════════ */
 
 import fs from 'node:fs';
@@ -28,10 +41,72 @@ import { fileURLToPath } from 'node:url';
 
 export const ITALIA = { latMin: 35.4, latMax: 47.2, lonMin: 6.5, lonMax: 18.7 };
 export const MATTONELLA = 2;           /* gradi: la mattonella di partenza */
-export const MATTONELLA_MIN = 0.5;     /* sotto, non si spezza più */
-export const TETTO_STAZIONI = 700;     /* tante in una mattonella: sospetto taglio → si spezza */
-export const TETTO_CHIAMATE = 150;     /* per giro */
+export const MATTONELLA_MIN = 0.2;     /* sotto, non si spezza più (0,25° è l'ultimo gradino) */
+export const SOGLIA_DENTRO = 350;      /* stazioni DENTRO il rettangolo: da qui in su si spezza */
+export const RISPOSTA_SOSPETTA = 1500; /* una risposta così grande può essere stata tagliata: si spezza */
+export const TETTO_STAZIONI = SOGLIA_DENTRO;   /* nome vecchio, tenuto per chi lo importa */
+export const TETTO_CHIAMATE = 150;     /* per giro, ritentativi compresi */
+export const TENTATIVI = 3;            /* per mattonella */
+export const PAUSE_MS = [3000, 10000]; /* fra un tentativo e l'altro */
+export const TEMPO_MAX_MS = 25000;     /* per chiamata */
 export const VUOTA_VALIDA_MS = 24 * 3600 * 1000;   /* una mattonella vuota si ricontrolla dopo un giorno */
+export const VERSIONE_MEMORIA = 2;     /* cambia → mattonelle.json vecchio si butta e si ricomincia */
+export const MARGINE_ITALIA = 0.35;    /* gradi oltre coste e confini: ~25 km, il raggio della carta */
+
+/* ————————————————— l'Italia, a grandi linee ————————————————— */
+/* Poligoni grossolani, [lat, lon]: terraferma, Sicilia, Sardegna e le isole
+   minori come quadratini. Servono solo a dire se una mattonella tocca
+   l'Italia (allargata del margine): la precisione del chilometro non conta. */
+export const ITALIA_POLIGONI = [
+  [[43.78, 7.53], [44.42, 6.90], [44.93, 6.73], [45.25, 6.90], [45.68, 6.88], [45.83, 6.86], [45.87, 7.17],
+   [45.98, 7.66], [45.93, 7.87], [46.25, 8.03], [46.30, 8.45], [46.05, 8.70], [45.83, 9.03], [46.05, 9.30],
+   [46.50, 9.45], [46.35, 10.05], [46.60, 10.20], [46.85, 10.45], [46.95, 11.00], [47.00, 11.50], [47.09, 12.19],
+   [46.80, 12.50], [46.65, 13.40], [46.55, 13.70], [46.20, 13.65], [45.75, 13.60], [45.60, 13.90], [45.45, 12.35],
+   [44.95, 12.55], [44.30, 12.35], [44.06, 12.57], [43.62, 13.52], [42.46, 14.21], [42.00, 15.00], [41.90, 16.20],
+   [41.60, 15.90], [41.13, 16.87], [40.64, 17.95], [40.15, 18.50], [39.80, 18.36], [40.05, 17.98], [40.47, 17.24],
+   [40.37, 16.80], [39.75, 16.50], [39.08, 17.13], [38.90, 17.10], [38.70, 16.55], [37.92, 16.06], [38.10, 15.65],
+   [38.25, 15.70], [38.62, 15.83], [38.90, 16.20], [39.36, 16.04], [39.99, 15.70], [40.03, 15.28], [40.68, 14.77],
+   [40.55, 14.20], [40.84, 14.25], [41.20, 13.57], [41.22, 13.05], [41.45, 12.62], [41.77, 12.23], [42.09, 11.79],
+   [42.40, 11.10], [42.93, 10.50], [43.55, 10.30], [44.10, 9.80], [44.40, 8.90], [44.30, 8.48], [43.88, 8.03]],
+  [[38.20, 15.55], [38.27, 15.24], [38.04, 14.02], [38.12, 13.36], [38.02, 12.50], [37.80, 12.43], [37.65, 12.60],
+   [37.50, 13.08], [37.29, 13.58], [37.10, 13.94], [37.07, 14.25], [36.72, 14.85], [36.68, 15.13], [37.07, 15.28],
+   [37.50, 15.09], [37.85, 15.29]],
+  [[41.24, 9.19], [40.92, 9.50], [40.50, 9.83], [39.94, 9.70], [39.10, 9.52], [39.20, 9.10], [38.87, 8.65],
+   [39.15, 8.30], [39.90, 8.50], [40.56, 8.16], [40.95, 8.22], [40.84, 8.40], [40.91, 8.71]],
+  [[38.55, 14.80], [38.55, 15.10], [38.35, 15.10], [38.35, 14.80]],      /* Eolie */
+  [[36.85, 11.90], [36.85, 12.05], [36.72, 12.05], [36.72, 11.90]],      /* Pantelleria */
+  [[35.55, 12.50], [35.55, 12.70], [35.45, 12.70], [35.45, 12.50]],      /* Lampedusa */
+  [[42.16, 15.45], [42.16, 15.55], [42.08, 15.55], [42.08, 15.45]],      /* Tremiti */
+  [[38.75, 13.15], [38.75, 13.22], [38.68, 13.22], [38.68, 13.15]],      /* Ustica */
+  [[42.85, 10.05], [42.85, 10.45], [42.70, 10.45], [42.70, 10.05]]       /* Elba */
+];
+
+function dentroPoligono(la, lo, poligono) {
+  let dentro = false;
+  for (let i = 0, j = poligono.length - 1; i < poligono.length; j = i++) {
+    const [la1, lo1] = poligono[i], [la2, lo2] = poligono[j];
+    if ((lo1 > lo) !== (lo2 > lo) && la < (la2 - la1) * (lo - lo1) / (lo2 - lo1) + la1) dentro = !dentro;
+  }
+  return dentro;
+}
+function segmentiSiIncrociano(a, b, c, d) {
+  const or = (p, q, r) => Math.sign((q[1] - p[1]) * (r[0] - p[0]) - (q[0] - p[0]) * (r[1] - p[1]));
+  return or(a, b, c) !== or(a, b, d) && or(c, d, a) !== or(c, d, b);
+}
+/** Il rettangolo (allargato del margine) tocca l'Italia? */
+export function toccaItalia(m, margine = MARGINE_ITALIA, poligoni = ITALIA_POLIGONI) {
+  const r = { latMin: m.latMin - margine, latMax: m.latMax + margine, lonMin: m.lonMin - margine, lonMax: m.lonMax + margine };
+  const angoli = [[r.latMin, r.lonMin], [r.latMin, r.lonMax], [r.latMax, r.lonMax], [r.latMax, r.lonMin]];
+  const lati = [[angoli[0], angoli[1]], [angoli[1], angoli[2]], [angoli[2], angoli[3]], [angoli[3], angoli[0]]];
+  for (const p of poligoni) {
+    for (const [la, lo] of p)
+      if (la >= r.latMin && la <= r.latMax && lo >= r.lonMin && lo <= r.lonMax) return true;   /* un vertice dentro */
+    for (const a of angoli) if (dentroPoligono(a[0], a[1], p)) return true;                 /* un angolo dentro l'Italia */
+    for (let i = 0, j = p.length - 1; i < p.length; j = i++)
+      for (const [s1, s2] of lati) if (segmentiSiIncrociano(p[i], p[j], s1, s2)) return true; /* i bordi si incrociano */
+  }
+  return false;
+}
 export const AEROPORTI = [
   'LIBR','LIBN','LIBG','LIBD','LIBV','LIBA','LIBP','LIBC','LICA','LICR','LICC','LICJ','LICT','LICD','LICG','LICB','LICZ',
   'LIEE','LIEO','LIEA','LIEB','LIRN','LIRI','LIRA','LIRF','LIRU','LIRQ','LIRP','LIRJ','LIRZ','LIRL','LIRM','LIRE','LIRV',
@@ -140,62 +215,161 @@ export function snellisci(s) {
   } catch (_) { return null; }
 }
 
-async function mattonella(tok, m, chiama) {
+export const attendi = ms => new Promise(r => setTimeout(r, ms));
+
+/** Una mattonella: fino a TENTATIVI chiamate, con pausa crescente sui 5xx,
+ *  sulla rete che cade e sul tempo scaduto. Un 4xx non si ritenta; 401/403/429
+ *  fermano il giro (gettone o quota: insistere peggiora le cose).
+ *  Restituisce { grezze, tentativi }; l'errore lanciato porta e.tentativi. */
+async function mattonella(tok, m, chiama, pausa = attendi) {
   const u = new URL('https://api.netatmo.com/api/getpublicdata');
   u.searchParams.set('lat_ne', m.latMax.toFixed(3)); u.searchParams.set('lon_ne', m.lonMax.toFixed(3));
   u.searchParams.set('lat_sw', m.latMin.toFixed(3)); u.searchParams.set('lon_sw', m.lonMin.toFixed(3));
   u.searchParams.set('required_data', 'temperature');
   u.searchParams.set('filter', 'false');
-  const r = await chiama(u.toString(), { headers: { Authorization: 'Bearer ' + tok } });
-  if (r.status === 429) { const e = new Error('Netatmo: troppe richieste (429)'); e.stop = true; throw e; }
-  if (!r.ok) throw new Error('getpublicdata HTTP ' + r.status);
-  const j = await r.json();
-  return Array.isArray(j.body) ? j.body : [];
+  let ultimo = null;
+  for (let tentativo = 1; tentativo <= TENTATIVI; tentativo++) {
+    let r;
+    try {
+      r = await chiama(u.toString(), { headers: { Authorization: 'Bearer ' + tok }, signal: AbortSignal.timeout(TEMPO_MAX_MS) });
+    } catch (e) {
+      ultimo = new Error(/abort|timeout/i.test(String(e && e.name) + String(e && e.message)) ? 'tempo scaduto' : 'rete: ' + (e && e.message));
+      ultimo.tentativi = tentativo;
+      if (tentativo < TENTATIVI) await pausa(PAUSE_MS[tentativo - 1]);
+      continue;
+    }
+    if (r.status === 429 || r.status === 403 || r.status === 401) {
+      const e = new Error(r.status === 429 ? 'Netatmo: troppe richieste (429)' : 'Netatmo: accesso negato (' + r.status + ')');
+      e.stop = true; e.tentativi = tentativo; throw e;
+    }
+    if (r.ok) {
+      const j = await r.json();
+      return { grezze: Array.isArray(j.body) ? j.body : [], tentativi: tentativo };
+    }
+    ultimo = new Error('getpublicdata HTTP ' + r.status);
+    ultimo.tentativi = tentativo;
+    if (r.status < 500) break;                                   /* 4xx: ritentare non serve */
+    if (tentativo < TENTATIVI) await pausa(PAUSE_MS[tentativo - 1]);
+  }
+  throw ultimo;
 }
 
 const chiaveM = m => [m.latMin, m.lonMin, m.latMax - m.latMin].map(v => v.toFixed(2)).join('_');
-
-/** Tutte le stazioni d'Italia, a mattonelle adattive e con un tetto di chiamate. */
-export async function raccogli(tok, radice, chiama, adesso = Date.now(), registro = console) {
-  const fileMatt = dir(radice, 'mattonelle.json');
-  const memoria = leggi(fileMatt, {});
-  const coda = [];
+const figli = m => {
+  const mezzoLa = (m.latMin + m.latMax) / 2, mezzoLo = (m.lonMin + m.lonMax) / 2;
+  return [
+    { latMin: m.latMin, lonMin: m.lonMin, latMax: mezzoLa, lonMax: mezzoLo },
+    { latMin: m.latMin, lonMin: mezzoLo, latMax: mezzoLa, lonMax: m.lonMax },
+    { latMin: mezzoLa, lonMin: m.lonMin, latMax: m.latMax, lonMax: mezzoLo },
+    { latMin: mezzoLa, lonMin: mezzoLo, latMax: m.latMax, lonMax: m.lonMax }];
+};
+const dentroRettangolo = (g, m) => {
+  const loc = g && g.place && g.place.location;
+  if (!Array.isArray(loc) || loc.length < 2) return false;
+  const lo = Number(loc[0]), la = Number(loc[1]);
+  return la >= m.latMin && la < m.latMax && lo >= m.lonMin && lo < m.lonMax;
+};
+export const mattonelleDiPartenza = () => {
+  const fuori = [];
   for (let la = ITALIA.latMin; la < ITALIA.latMax; la += MATTONELLA)
     for (let lo = ITALIA.lonMin; lo < ITALIA.lonMax; lo += MATTONELLA)
-      coda.push({ latMin: la, lonMin: lo, latMax: Math.min(la + MATTONELLA, ITALIA.latMax), lonMax: Math.min(lo + MATTONELLA, ITALIA.lonMax) });
+      fuori.push({ latMin: la, lonMin: lo, latMax: Math.min(la + MATTONELLA, ITALIA.latMax), lonMax: Math.min(lo + MATTONELLA, ITALIA.lonMax) });
+  return fuori;
+};
+
+/** Tutte le stazioni d'Italia, a mattonelle adattive e con un tetto di chiamate.
+ *  L'albero delle mattonelle vive in mattonelle.json: le spezzate non si
+ *  richiedono (si scende ai figli), le vuote si saltano per un giorno, quelle
+ *  che non toccano l'Italia non si guardano nemmeno. */
+export async function raccogli(tok, radice, chiama, adesso = Date.now(), registro = console, pausa = attendi) {
+  const fileMatt = dir(radice, 'mattonelle.json');
+  let memoria = leggi(fileMatt, {});
+  if (!memoria || memoria._versione !== VERSIONE_MEMORIA) memoria = { _versione: VERSIONE_MEMORIA };
+
+  const coda = [];
+  let fuori = 0;
+  const scendi = m => {
+    if (!toccaItalia(m)) { fuori++; return; }
+    const nota = memoria[chiaveM(m)];
+    if (nota && nota.spezzata) { figli(m).forEach(scendi); return; }      /* già imparato: dritti alle foglie */
+    coda.push(m);
+  };
+  mattonelleDiPartenza().forEach(scendi);
 
   const stazioni = new Map();
-  let chiamate = 0, spezzate = 0, saltate = 0;
+  const mattonelleFallite = [];
+  let chiamate = 0, spezzate = 0, saltate = 0, ritentate = 0, fallite = 0;
   while (coda.length) {
     const m = coda.shift();
     const k = chiaveM(m);
     const nota = memoria[k];
-    if (nota && nota.n === 0 && adesso - nota.ts < VUOTA_VALIDA_MS) { saltate++; continue; }   /* mare, o montagna deserta */
+    if (nota && nota.dentro === 0 && adesso - nota.ts < VUOTA_VALIDA_MS) { saltate++; continue; }   /* mare, o montagna deserta */
     if (chiamate >= TETTO_CHIAMATE) { registro.log('  · tetto di ' + TETTO_CHIAMATE + ' chiamate raggiunto: il resto al prossimo giro'); break; }
-    let grezze;
-    try { chiamate++; grezze = await mattonella(tok, m, chiama); }
-    catch (e) { if (e.stop) { registro.log('  ✘ ' + e.message + ': mi fermo qui'); break; } registro.log('  ⚠ ' + k + ': ' + e.message); continue; }
-    const lato = m.latMax - m.latMin;
-    if (grezze.length >= TETTO_STAZIONI && lato > MATTONELLA_MIN) {
-      /* troppe: Netatmo potrebbe averne tagliate — si spezza in quattro e si rifà */
-      spezzate++;
-      const mezzoLa = (m.latMin + m.latMax) / 2, mezzoLo = (m.lonMin + m.lonMax) / 2;
-      coda.unshift(
-        { latMin: m.latMin, lonMin: m.lonMin, latMax: mezzoLa, lonMax: mezzoLo },
-        { latMin: m.latMin, lonMin: mezzoLo, latMax: mezzoLa, lonMax: m.lonMax },
-        { latMin: mezzoLa, lonMin: m.lonMin, latMax: m.latMax, lonMax: mezzoLo },
-        { latMin: mezzoLa, lonMin: mezzoLo, latMax: m.latMax, lonMax: m.lonMax });
-      memoria[k] = { n: grezze.length, ts: adesso, spezzata: 1 };
+    let esito;
+    try { esito = await mattonella(tok, m, chiama, pausa); }
+    catch (e) {
+      chiamate += e.tentativi || 1;
+      if (e.stop) { mattonelleFallite.push(m); registro.log('  ✘ ' + e.message + ': mi fermo qui'); break; }
+      fallite++;
+      mattonelleFallite.push(m);
+      registro.log('  ⚠ ' + k + ': ' + e.message + (e.tentativi > 1 ? ' (dopo ' + e.tentativi + ' tentativi)' : ''));
       continue;
     }
-    memoria[k] = { n: grezze.length, ts: adesso };
+    chiamate += esito.tentativi;
+    if (esito.tentativi > 1) ritentate++;
+    const grezze = esito.grezze;
+    const dentro = grezze.filter(g => dentroRettangolo(g, m)).length;
+    const lato = m.latMax - m.latMin;
+    if ((dentro >= SOGLIA_DENTRO || grezze.length >= RISPOSTA_SOSPETTA) && lato / 2 >= MATTONELLA_MIN) {
+      /* fitta (o risposta sospetta di taglio): si spezza in quattro e si rifà subito */
+      spezzate++;
+      coda.unshift(...figli(m).filter(f => toccaItalia(f) || (fuori++, false)));
+      memoria[k] = { n: grezze.length, dentro, ts: adesso, spezzata: 1 };
+    } else {
+      memoria[k] = { n: grezze.length, dentro, ts: adesso };
+    }
+    /* le stazioni arrivate si tengono sempre, anche da una mattonella che si spezza:
+       sono letture vere, e i figli aggiungeranno quelle che il taglio ha lasciato fuori */
     for (const g of grezze) {
       const s = snellisci(g);
       if (s && s.id) stazioni.set(s.id, s);
     }
   }
   scrivi(fileMatt, memoria);
-  return { stazioni: [...stazioni.values()], chiamate, spezzate, saltate };
+  /* chi è rimasto in coda per il tetto o per lo stop non è stato letto: vale come fallito,
+     così le sue letture del giro prima vengono riportate */
+  for (const m of coda) mattonelleFallite.push(m);
+  return { stazioni: [...stazioni.values()], chiamate, spezzate, saltate, fuori, ritentate, fallite, mattonelleFallite };
+}
+
+/* ————————————————— il riporto delle letture del giro prima ————————————————— */
+
+/** Le stazioni già pubblicate (celle/*.json nella cartella): mappa id → stazione. */
+export function lettureprecedenti(radice) {
+  const fuori = new Map();
+  const cartella = dir(radice, 'celle');
+  let nomi = [];
+  try { nomi = fs.readdirSync(cartella).filter(n => n.endsWith('.json')); } catch (_) { return fuori; }
+  for (const n of nomi) {
+    const c = leggi(dir(cartella, n), null);
+    for (const st of (c && Array.isArray(c.stazioni) ? c.stazioni : [])) if (st && st.id) fuori.set(st.id, st);
+  }
+  return fuori;
+}
+
+/** Dentro le mattonelle fallite si rimettono le stazioni del giro prima (con la LORO ora
+ *  di lettura: se è vecchia, l'app la scarta da sola). Torna quante ne ha riportate. */
+export function riporta(stazioni, mattonelleFallite, precedenti) {
+  if (!mattonelleFallite.length || !precedenti.size) return 0;
+  const presenti = new Set(stazioni.map(s => s.id));
+  let riportate = 0;
+  for (const st of precedenti.values()) {
+    if (presenti.has(st.id)) continue;
+    const la = Number(st.la), lo = Number(st.lo);
+    if (!mattonelleFallite.some(m => la >= m.latMin && la < m.latMax && lo >= m.lonMin && lo < m.lonMax)) continue;
+    stazioni.push(st); presenti.add(st.id); riportate++;
+  }
+  return riportate;
 }
 
 /* ————————————————— gli aeroporti (METAR) ————————————————— */
@@ -252,15 +426,26 @@ export function scriviTutto(radice, stazioni, aerop, meta, adesso = Date.now()) 
 
 /* ————————————————— il giro completo ————————————————— */
 
-export async function giro(amb = process.env, radice = process.cwd(), chiama = fetch, registro = console) {
+export async function giro(amb = process.env, radice = process.cwd(), chiama = fetch, registro = console, pausa = attendi) {
   const t0 = Date.now();
   registro.log('Ponte stazioni · ' + new Date().toISOString());
   const tok = await gettone(amb, radice, chiama);
   registro.log('  ✔ gettone Netatmo rinnovato');
-  const r = await raccogli(tok, radice, chiama, Date.now(), registro);
-  registro.log('  ✔ Netatmo: ' + r.stazioni.length + ' stazioni con ' + r.chiamate + ' chiamate (' + r.spezzate + ' mattonelle spezzate, ' + r.saltate + ' saltate perché vuote)');
-  const a = await aeroporti(chiama, registro);
-  registro.log('  ✔ aeroporti: ' + a.length + ' osservazioni');
+  const precedenti = lettureprecedenti(radice);          /* prima che scriviTutto le cancelli */
+  const r = await raccogli(tok, radice, chiama, Date.now(), registro, pausa);
+  registro.log('  ✔ Netatmo: ' + r.stazioni.length + ' stazioni con ' + r.chiamate + ' chiamate (' + r.spezzate + ' mattonelle spezzate, '
+             + r.saltate + ' saltate perché vuote, ' + r.fuori + ' fuori dall\'Italia, ' + r.ritentate + ' ritentate, ' + r.fallite + ' fallite)');
+  const riportate = riporta(r.stazioni, r.mattonelleFallite, precedenti);
+  if (riportate) registro.log('  ↻ riportate ' + riportate + ' letture del giro prima nelle ' + r.mattonelleFallite.length + ' mattonelle non lette');
+  let a = await aeroporti(chiama, registro);
+  if (a.length) registro.log('  ✔ aeroporti: ' + a.length + ' osservazioni');
+  else {
+    /* il servizio degli aeroporti non ha risposto: restano le osservazioni del giro
+       prima, con la LORO ora (l'app la mostra, e sa quanto sono vecchie) */
+    const prima = leggi(dir(radice, 'aeroporti.json'), null);
+    a = prima && Array.isArray(prima.aeroporti) ? prima.aeroporti : [];
+    registro.log(a.length ? '  ↻ aeroporti: servizio muto, riportate le ' + a.length + ' osservazioni del giro prima' : '  ⚠ aeroporti: nessuna osservazione');
+  }
   const conteggi = scriviTutto(radice, r.stazioni, a, { chiamate: r.chiamate, durataMs: Date.now() - t0 });
   registro.log('  ✔ scritte ' + Object.keys(conteggi).length + ' celle in ' + Math.round((Date.now() - t0) / 1000) + ' s');
   return { stazioni: r.stazioni.length, aeroporti: a.length, celle: Object.keys(conteggi).length, chiamate: r.chiamate };
