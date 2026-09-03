@@ -24,9 +24,13 @@
    · Netatmo risponde 503 a sprazzi: ogni mattonella si ritenta fino a
      tre volte con una pausa crescente, e ogni chiamata ha un tempo massimo.
    · Netatmo restituisce stazioni anche ben fuori dal rettangolo chiesto
-     e, dove è denso, TAGLIA la risposta. Perciò si spezza una mattonella
-     contando le stazioni DENTRO il suo rettangolo (non quante ne arrivano),
-     e si scende fino a 0,25° nelle zone più fitte.
+     e, dove è denso, TAGLIA la risposta senza dirlo. Perciò una mattonella
+     si spezza sia quando dentro ci sono tante stazioni, sia quando la
+     risposta è grande (da 800 in su: potrebbe essere tagliata), scendendo
+     fino a 0,25° nelle zone più fitte. E ogni stazione già pubblicata che
+     stavolta non arriva (taglio, 503, tetto) si riporta com'era, con la
+     SUA ora di lettura, finché ha meno di tre ore: l'app usa solo le
+     letture fresche, quindi non mostra mai un numero stantio.
    · L'albero delle mattonelle si ricorda da un giro all'altro: chi era da
      spezzare non si richiede più, si va dritti alle sue foglie.
    · Il rettangolo dell'Italia contiene Svizzera, Francia, Austria, Croazia
@@ -43,13 +47,14 @@ export const ITALIA = { latMin: 35.4, latMax: 47.2, lonMin: 6.5, lonMax: 18.7 };
 export const MATTONELLA = 2;           /* gradi: la mattonella di partenza */
 export const MATTONELLA_MIN = 0.2;     /* sotto, non si spezza più (0,25° è l'ultimo gradino) */
 export const SOGLIA_DENTRO = 350;      /* stazioni DENTRO il rettangolo: da qui in su si spezza */
-export const RISPOSTA_SOSPETTA = 1500; /* una risposta così grande può essere stata tagliata: si spezza */
+export const RISPOSTA_SOSPETTA = 800;  /* una risposta così grande può essere stata tagliata: si spezza */
 export const TETTO_STAZIONI = SOGLIA_DENTRO;   /* nome vecchio, tenuto per chi lo importa */
-export const TETTO_CHIAMATE = 150;     /* per giro, ritentativi compresi */
+export const TETTO_CHIAMATE = 160;     /* per giro, ritentativi compresi */
 export const TENTATIVI = 3;            /* per mattonella */
 export const PAUSE_MS = [3000, 10000]; /* fra un tentativo e l'altro */
 export const TEMPO_MAX_MS = 25000;     /* per chiamata */
 export const VUOTA_VALIDA_MS = 24 * 3600 * 1000;   /* una mattonella vuota si ricontrolla dopo un giorno */
+export const RIPORTO_MAX_S = 3 * 3600;  /* una lettura del giro prima si riporta se ha meno di tre ore */
 export const VERSIONE_MEMORIA = 2;     /* cambia → mattonelle.json vecchio si butta e si ricomincia */
 export const MARGINE_ITALIA = 0.35;    /* gradi oltre coste e confini: ~25 km, il raggio della carta */
 
@@ -357,16 +362,18 @@ export function lettureprecedenti(radice) {
   return fuori;
 }
 
-/** Dentro le mattonelle fallite si rimettono le stazioni del giro prima (con la LORO ora
- *  di lettura: se è vecchia, l'app la scarta da sola). Torna quante ne ha riportate. */
-export function riporta(stazioni, mattonelleFallite, precedenti) {
-  if (!mattonelleFallite.length || !precedenti.size) return 0;
+/** Le stazioni del giro prima che stavolta non sono arrivate (mattonella fallita, risposta
+ *  tagliata, tetto raggiunto) si rimettono com'erano, con la LORO ora di lettura, purché
+ *  abbiano meno di RIPORTO_MAX_S: l'app usa solo le letture fresche, e una stazione spenta
+ *  sparisce da sola dopo tre ore. Torna quante ne ha riportate. */
+export function riporta(stazioni, precedenti, adessoS = Date.now() / 1000, maxEtaS = RIPORTO_MAX_S) {
+  if (!precedenti.size) return 0;
   const presenti = new Set(stazioni.map(s => s.id));
   let riportate = 0;
   for (const st of precedenti.values()) {
     if (presenti.has(st.id)) continue;
-    const la = Number(st.la), lo = Number(st.lo);
-    if (!mattonelleFallite.some(m => la >= m.latMin && la < m.latMax && lo >= m.lonMin && lo < m.lonMax)) continue;
+    const ts = Number(st.ts);
+    if (!Number.isFinite(ts) || adessoS - ts > maxEtaS) continue;
     stazioni.push(st); presenti.add(st.id); riportate++;
   }
   return riportate;
@@ -435,8 +442,8 @@ export async function giro(amb = process.env, radice = process.cwd(), chiama = f
   const r = await raccogli(tok, radice, chiama, Date.now(), registro, pausa);
   registro.log('  ✔ Netatmo: ' + r.stazioni.length + ' stazioni con ' + r.chiamate + ' chiamate (' + r.spezzate + ' mattonelle spezzate, '
              + r.saltate + ' saltate perché vuote, ' + r.fuori + ' fuori dall\'Italia, ' + r.ritentate + ' ritentate, ' + r.fallite + ' fallite)');
-  const riportate = riporta(r.stazioni, r.mattonelleFallite, precedenti);
-  if (riportate) registro.log('  ↻ riportate ' + riportate + ' letture del giro prima nelle ' + r.mattonelleFallite.length + ' mattonelle non lette');
+  const riportate = riporta(r.stazioni, precedenti);
+  if (riportate) registro.log('  ↻ riportate ' + riportate + ' letture del giro prima (mattonelle non lette o risposte tagliate' + (r.mattonelleFallite.length ? ', ' + r.mattonelleFallite.length + ' mattonelle non lette' : '') + ')');
   let a = await aeroporti(chiama, registro);
   if (a.length) registro.log('  ✔ aeroporti: ' + a.length + ' osservazioni');
   else {
