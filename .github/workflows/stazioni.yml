@@ -1,0 +1,81 @@
+# Meteo Radar · le stazioni vicine (v65)
+#
+# Ogni ora parte un giro lungo: interroga Netatmo e gli aeroporti tre volte
+# (subito, dopo 18 minuti, dopo 36) e pubblica le letture sul ramo "dati",
+# che contiene SEMPRE un solo commit: niente cronologia che cresce, e il
+# ramo principale (questo file, il programma) non viene mai toccato.
+#
+# I segreti (NETATMO_CLIENT_ID, NETATMO_CLIENT_SECRET, NETATMO_REFRESH_TOKEN)
+# stanno nelle impostazioni del repository: nell'app non entra niente.
+# Il gettone rinnovato vive cifrato in stato/netatmo.enc sul ramo "dati".
+#
+# GitHub non garantisce gli avvii programmati (lo sappiamo dal blog): il
+# giro lungo fa sì che anche un avvio ogni tanto tenga le letture fresche,
+# e si può sempre chiamare da fuori con workflow_dispatch (cron-job.org).
+name: Stazioni vicine
+
+on:
+  schedule:
+    - cron: '9 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stazioni-vicine
+  cancel-in-progress: false
+
+jobs:
+  raccogli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    steps:
+      - name: Prendi il programma
+        uses: actions/checkout@v5
+
+      - name: Prepara Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Recupera lo stato dal ramo dati
+        run: |
+          mkdir -p stato
+          if git fetch --depth 1 origin dati 2>/dev/null; then
+            git show FETCH_HEAD:stato/netatmo.enc > stato/netatmo.enc 2>/dev/null || true
+            git show FETCH_HEAD:mattonelle.json > mattonelle.json 2>/dev/null || true
+            [ -s stato/netatmo.enc ] || rm -f stato/netatmo.enc
+            [ -s mattonelle.json ] || rm -f mattonelle.json
+            echo "stato recuperato"
+          else
+            echo "primo giro: nessuno stato"
+          fi
+
+      - name: Tre giri di letture
+        env:
+          NETATMO_CLIENT_ID: ${{ secrets.NETATMO_CLIENT_ID }}
+          NETATMO_CLIENT_SECRET: ${{ secrets.NETATMO_CLIENT_SECRET }}
+          NETATMO_REFRESH_TOKEN: ${{ secrets.NETATMO_REFRESH_TOKEN }}
+        run: |
+          for giro in 1 2 3; do
+            echo "── giro $giro ──"
+            if node ponte_stazioni.mjs; then
+              rm -rf /tmp/pub && mkdir -p /tmp/pub
+              cp -r celle /tmp/pub/ 2>/dev/null || true
+              cp aeroporti.json indice.json mattonelle.json /tmp/pub/ 2>/dev/null || true
+              mkdir -p /tmp/pub/stato && cp stato/netatmo.enc /tmp/pub/stato/ 2>/dev/null || true
+              cd /tmp/pub
+              git init -q -b dati
+              git config user.name "Meteo Radar"
+              git config user.email "stazioni@meteoradar.local"
+              git add -A
+              git commit -q -m "Letture del $(TZ=Europe/Rome date '+%d/%m/%Y %H:%M')"
+              git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" dati
+              cd "$GITHUB_WORKSPACE"
+              echo "pubblicato"
+            else
+              echo "giro $giro fallito: si riprova al prossimo"
+            fi
+            if [ "$giro" -lt 3 ]; then sleep 1080; fi
+          done
