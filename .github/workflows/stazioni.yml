@@ -1,4 +1,4 @@
-# Meteo Radar · le stazioni vicine (v65 · ponte 2)
+# Meteo Radar · le stazioni vicine (v65 · ponte 2.2)
 #
 # Ogni avvio è un giro lungo: interroga Netatmo e gli aeroporti tre volte
 # (subito, dopo 18 minuti, dopo 36) e pubblica le letture sul ramo "dati",
@@ -9,19 +9,20 @@
 # stanno nelle impostazioni del repository: nell'app non entra niente.
 # Il gettone rinnovato vive cifrato in stato/netatmo.enc sul ramo "dati".
 #
-# PERCHÉ SI RILANCIA DA SOLO. GitHub non garantisce gli avvii programmati:
-# il 3 settembre ha saltato quelli delle 12:09 e delle 13:09, e l'app è
-# rimasta senza letture fresche. Perciò alla fine di ogni giro lungo il
-# workflow chiede a GitHub di farne partire un altro (workflow_dispatch):
-# la catena non dipende dall'orologio di GitHub. L'orario programmato resta
-# come rete di sicurezza: se la catena si spezza, la riannoda. Non si
-# raddoppia mai: prima di rilanciarsi si controlla che non ci sia già un
-# altro giro in coda o in corso.
+# PERCHÉ SI RILANCIA DA SOLO, E SUBITO. GitHub non garantisce gli avvii
+# programmati (il 3 settembre ne ha saltati sette su otto), e ogni tanto
+# spegne un runner a metà lavoro ("The operation was canceled", run #8,
+# senza che nessun nostro comando fosse fallito). Perciò ogni giro lungo
+# PRENOTA il successivo appena parte: il successivo resta in coda (la
+# concurrency ne fa aspettare uno solo) e parte quando questo finisce —
+# oppure entro un minuto, se questo viene ucciso. Prima di prenotare si
+# controlla che non ci sia già un giro in coda, così non si raddoppia mai.
+# L'orario programmato resta come rete di sicurezza in più.
 name: Stazioni vicine
 
 on:
   schedule:
-    - cron: '9 * * * *'
+    - cron: '9,39 * * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -39,6 +40,29 @@ jobs:
     steps:
       - name: Prendi il programma
         uses: actions/checkout@v5
+
+      - name: Prenota il prossimo giro lungo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          altri=0
+          for stato in queued waiting pending requested; do
+            n=$(gh run list --repo "${{ github.repository }}" --workflow "${{ github.workflow }}" --status "$stato" \
+                  --json databaseId --jq "[.[] | select(.databaseId != ${{ github.run_id }})] | length" 2>/dev/null || echo 0)
+            altri=$((altri + n))
+          done
+          if [ "$altri" -gt 0 ]; then
+            echo "c'è già un giro in coda ($altri): non prenoto"
+          else
+            for tentativo in 1 2 3; do
+              if gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"; then
+                echo "prossimo giro prenotato (parte quando questo finisce, o subito se questo muore)"
+                break
+              fi
+              echo "prenotazione non riuscita (tentativo $tentativo): riprovo fra 20 s"
+              sleep 20
+            done
+          fi
 
       - name: Prepara Node
         uses: actions/setup-node@v5
@@ -70,42 +94,55 @@ jobs:
           NETATMO_CLIENT_SECRET: ${{ secrets.NETATMO_CLIENT_SECRET }}
           NETATMO_REFRESH_TOKEN: ${{ secrets.NETATMO_REFRESH_TOKEN }}
         run: |
+          pubblica() {
+            rm -rf /tmp/pub && mkdir -p /tmp/pub
+            cp -r celle /tmp/pub/ 2>/dev/null || true
+            cp aeroporti.json indice.json mattonelle.json /tmp/pub/ 2>/dev/null || true
+            mkdir -p /tmp/pub/stato && cp stato/netatmo.enc /tmp/pub/stato/ 2>/dev/null || true
+            cd /tmp/pub
+            git init -q -b dati
+            git config user.name "Meteo Radar"
+            git config user.email "stazioni@meteoradar.local"
+            git add -A
+            git commit -q -m "Letture del $(TZ=Europe/Rome date '+%d/%m/%Y %H:%M')"
+            # la spinta su GitHub può cadere per un attimo di rete: si riprova
+            for tentativo in 1 2 3; do
+              if git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" dati; then
+                cd "$GITHUB_WORKSPACE"
+                echo "pubblicato"
+                return 0
+              fi
+              echo "spinta su GitHub non riuscita (tentativo $tentativo)"
+              sleep 15
+            done
+            cd "$GITHUB_WORKSPACE"
+            echo "NON pubblicato: si riprova al prossimo giro"
+            return 0
+          }
           for giro in 1 2 3; do
             echo "── giro $giro ──"
             if node ponte_stazioni.mjs; then
-              rm -rf /tmp/pub && mkdir -p /tmp/pub
-              cp -r celle /tmp/pub/ 2>/dev/null || true
-              cp aeroporti.json indice.json mattonelle.json /tmp/pub/ 2>/dev/null || true
-              mkdir -p /tmp/pub/stato && cp stato/netatmo.enc /tmp/pub/stato/ 2>/dev/null || true
-              cd /tmp/pub
-              git init -q -b dati
-              git config user.name "Meteo Radar"
-              git config user.email "stazioni@meteoradar.local"
-              git add -A
-              git commit -q -m "Letture del $(TZ=Europe/Rome date '+%d/%m/%Y %H:%M')"
-              git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" dati
-              cd "$GITHUB_WORKSPACE"
-              echo "pubblicato"
+              pubblica
             else
               echo "giro $giro fallito: si riprova al prossimo"
             fi
             if [ "$giro" -lt 3 ]; then sleep 1080; fi
           done
 
-      - name: Rilancia il prossimo giro lungo
+      - name: Controllo finale della prenotazione
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           altri=0
-          for stato in queued waiting pending requested in_progress; do
+          for stato in queued waiting pending requested; do
             n=$(gh run list --repo "${{ github.repository }}" --workflow "${{ github.workflow }}" --status "$stato" \
                   --json databaseId --jq "[.[] | select(.databaseId != ${{ github.run_id }})] | length" 2>/dev/null || echo 0)
             altri=$((altri + n))
           done
           if [ "$altri" -gt 0 ]; then
-            echo "c'è già un altro giro in coda o in corso ($altri): non mi rilancio"
+            echo "il prossimo giro è in coda ($altri): tutto a posto"
           else
-            gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
-            echo "prossimo giro chiesto a GitHub"
+            echo "nessun giro in coda (la prenotazione è stata annullata?): lo prenoto adesso"
+            gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" && echo "prenotato" || echo "prenotazione non riuscita: ci penserà l'orario programmato"
           fi
