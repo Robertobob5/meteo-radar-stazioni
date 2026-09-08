@@ -36,6 +36,15 @@
    · Il rettangolo dell'Italia contiene Svizzera, Francia, Austria, Croazia
      e Tunisia: le mattonelle che non toccano l'Italia (con 25 km di
      margine, il raggio della carta) non si chiedono affatto.
+
+   PONTE 3 (8 settembre 2026): LA REPUTAZIONE DELLE STAZIONI. A ogni giro,
+   per ogni stazione, si annota quanto legge rispetto alle vicine e quanto
+   la sua zona sta sopra l'aeroporto, diviso per cielo (notte · velato ·
+   sole, dall'altezza del sole calcolata e dalle nubi dei METAR). Non si
+   conserva la cronologia, solo somme che invecchiano. Nascono i file
+   "reputazione/<cella>.json" accanto ai dati: l'app di oggi non li guarda,
+   li userà la v72.2 per correggere i sensori starati e scartare quelli
+   che stanno al sole. Le letture pubblicate per l'app NON cambiano.
    ════════════════════════════════════════════════════════════════ */
 
 import fs from 'node:fs';
@@ -396,6 +405,7 @@ export function snellisciMetar(m) {
       dir: Number.isFinite(Number(m.wdir)) ? Math.round(Number(m.wdir)) : null,
       vento: nodi(m.wspd), raff: nodi(m.wgst),
       vis: m.visib !== undefined && m.visib !== null ? String(m.visib) : null,
+      q: Number.isFinite(Number(m.elev)) ? Math.round(Number(m.elev)) : undefined,   /* ponte 3: la quota, se il servizio la manda */
       wx: m.wxString ? String(m.wxString) : '',
       nubi: Array.isArray(m.clouds) && m.clouds.length ? String(m.clouds[0].cover || '') : '',
       ts, grezzo: m.rawOb ? String(m.rawOb).slice(0, 160) : ''
@@ -411,6 +421,330 @@ export async function aeroporti(chiama, registro = console) {
     const j = await r.json();
     return (Array.isArray(j) ? j : []).map(snellisciMetar).filter(Boolean);
   } catch (e) { registro.log('  ⚠ aeroporti: ' + e.message); return []; }
+}
+
+/* ————————————————— la reputazione delle stazioni (ponte 3) —————————————————
+
+   Il ponte vede quello che nessun telefono può vedere: tutte le stazioni
+   d'Italia, ogni venti minuti, anche alle tre di notte. Da qui si impara,
+   per ogni singola stazione, DUE cose diverse che non vanno confuse:
+
+   1 · il DIFETTO PERSONALE del sensore. Si misura contro le vicine, non
+       contro l'aeroporto: quanto legge questa stazione rispetto alla
+       mediana delle altre entro 25 km, riportate alla sua quota. Se di
+       notte legge sempre un grado più delle vicine, quel grado è suo (una
+       parete che restituisce calore, un sensore starato); se legge come
+       loro di notte ma tre gradi più col sole alto, quei tre gradi sono
+       il sole che le batte addosso. Questo conto non ha bisogno di nessun
+       aeroporto: funziona ovunque ci siano almeno quattro stazioni.
+
+   2 · la DIFFERENZA DI ZONA, che è vera e NON va corretta: quanto tutta
+       la zona sta sopra o sotto l'aeroporto di riferimento (collina contro
+       pianura, città contro campagna). Ozzano non è Borgo Panigale, e se
+       si misurasse il difetto dei sensori contro l'aeroporto si finirebbe
+       per cancellare una differenza reale del territorio.
+
+   Le osservazioni non si conservano una per una: si accumulano in somme,
+   divise per cielo (notte · velato · sole), e ogni giorno le vecchie
+   pesano un po' meno (metà dopo tre settimane), così una stazione spostata
+   o riparata torna pulita da sola invece di restare marchiata per sempre.
+
+   Questo blocco RACCOGLIE E BASTA: i file "reputazione/*.json" nascono
+   accanto ai dati, l'app di oggi non li guarda nemmeno. Si accenderanno
+   nella v72.2, quando i numeri saranno abbastanza.
+   ———————————————————————————————————————————————————————————————————— */
+
+export const REP_VERSIONE = 1;
+export const REP_RAGGIO_KM = 25;        /* le vicine con cui ci si confronta: lo stesso raggio della carta dell'app */
+export const REP_MIN_VICINE = 3;        /* sotto, di questa stazione non si impara niente in questo giro */
+export const REP_AERO_KM = 60;          /* l'aeroporto di riferimento della zona (per la differenza di zona) */
+export const REP_CIELO_KM = 120;        /* per sapere se c'è il sole o è coperto basta un aeroporto della regione */
+export const REP_AERO_MAX_S = 90 * 60;  /* e la sua osservazione dev'essere di meno di un'ora e mezza fa */
+export const REP_GRADIENTE = 0.0065;    /* °C per metro */
+export const REP_QUOTA_MAX = 600;       /* oltre questo dislivello la quota dichiarata non è credibile: niente correzione */
+export const REP_FRESCHE_S = 45 * 60;   /* solo letture fresche, come nell'app */
+export const REP_SOLE_ALTO = 8;         /* gradi sopra l'orizzonte: sotto, il sole non scalda ancora i sensori */
+export const REP_NOTTE = -4;            /* gradi sotto l'orizzonte: da qui in giù è notte piena */
+export const REP_DIMEZZA_GIORNI = 21;   /* le osservazioni vecchie pesano metà dopo tre settimane */
+export const REP_MIN_OSS = 5;           /* osservazioni in una classe, per dire qualcosa */
+export const REP_MAX_SCARTO = 15;       /* oltre, non è una stazione al sole: è rotta, e non insegna niente */
+export const REP_DIMENTICA_GIORNI = 30; /* non vista da un mese: si toglie dalla memoria */
+export const REP_CLASSI = ['notte', 'velato', 'sole', 'giorno'];
+
+/** quota (m) degli aeroporti con METAR, per chi non la manda nell'osservazione */
+export const QUOTE_AERO = { LIPE: 37, LIMC: 234, LIML: 103, LIRF: 3, LIRA: 130, LICC: 12, LIPZ: 2, LIRN: 88, LIMF: 301, LIME: 238,
+  LIPX: 73, LIRP: 2, LIRQ: 38, LIBD: 54, LICJ: 20, LIEE: 4, LIEO: 11, LIPR: 13, LIPY: 15, LIBR: 15, LIRZ: 211, LICA: 12, LIBP: 15,
+  LIPQ: 12, LIMJ: 3, LIPH: 18, LIPK: 30, LIPO: 109, LIMZ: 386, LIRJ: 31, LICT: 7, LICD: 21, LIBC: 158, LICR: 29, LIRL: 28, LIBG: 65,
+  LIQS: 193, LIPU: 13, LIDT: 186, LIPB: 240, LIMW: 545, LIRV: 308, LIPA: 126, LIMP: 49, LIPC: 5, LIRE: 12, LIMG: 45, LIQW: 13,
+  LIED: 28, LIEA: 27, LIBV: 350, LIRG: 89, LIPS: 45, LICZ: 24, LIBA: 57, LIPI: 53, LIBN: 48, LIMS: 212, LIPD: 53, LIPL: 109,
+  LIRM: 6, LIRU: 74, LIQN: 13, LIRH: 145, LIMA: 18, LIMN: 169, LIMU: 12, LIMQ: 17, LIVT: 4 };
+
+export function distanzaKm(la1, lo1, la2, lo2) {
+  const r = 6371, g = Math.PI / 180;
+  const dLa = (la2 - la1) * g, dLo = (lo2 - lo1) * g;
+  const a = Math.sin(dLa / 2) ** 2 + Math.cos(la1 * g) * Math.cos(la2 * g) * Math.sin(dLo / 2) ** 2;
+  return 2 * r * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+export function medianaRep(valori) {
+  const s = valori.filter(Number.isFinite).sort((a, b) => a - b);
+  const n = s.length;
+  return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : NaN;
+}
+
+/** L'altezza del sole sull'orizzonte, in gradi (NOAA). Niente chiamate a nessuno: si calcola. */
+export function altezzaSole(la, lo, quando = new Date()) {
+  const d = quando instanceof Date ? quando : new Date(quando);
+  if (!Number.isFinite(la) || !Number.isFinite(lo) || isNaN(d.getTime())) return NaN;
+  const rad = Math.PI / 180;
+  const giorni = (d.getTime() - Date.UTC(d.getUTCFullYear(), 0, 1)) / 86400000;
+  const g = 2 * Math.PI / 365 * giorni;
+  const eqt = 229.18 * (0.000075 + 0.001868 * Math.cos(g) - 0.032077 * Math.sin(g)
+            - 0.014615 * Math.cos(2 * g) - 0.040849 * Math.sin(2 * g));            /* minuti */
+  const decl = 0.006918 - 0.399912 * Math.cos(g) + 0.070257 * Math.sin(g) - 0.006758 * Math.cos(2 * g)
+             + 0.000907 * Math.sin(2 * g) - 0.002697 * Math.cos(3 * g) + 0.00148 * Math.sin(3 * g);   /* radianti */
+  const minutiUTC = d.getUTCHours() * 60 + d.getUTCMinutes() + d.getUTCSeconds() / 60;
+  const oraSolare = minutiUTC + eqt + 4 * lo;                                       /* minuti, ora solare vera */
+  const angolo = (oraSolare / 4 - 180) * rad;                                       /* angolo orario */
+  const cosZ = Math.sin(la * rad) * Math.sin(decl) + Math.cos(la * rad) * Math.cos(decl) * Math.cos(angolo);
+  return 90 - Math.acos(Math.max(-1, Math.min(1, cosZ))) / rad;
+}
+
+/** Il cielo di quel momento: 'notte' · 'velato' (giorno coperto) · 'sole' · 'giorno' (cielo ignoto).
+ *  Fra i −4° e gli +8° di altezza non si classifica niente: all'alba e al tramonto i sensori
+ *  si stanno ancora scaldando o raffreddando e insegnerebbero il falso. */
+export function classeCielo(altezza, nubi, aeroportoNoto = true) {
+  if (!Number.isFinite(altezza)) return null;
+  if (altezza <= REP_NOTTE) return 'notte';
+  if (altezza < REP_SOLE_ALTO) return null;
+  if (!aeroportoNoto) return 'giorno';
+  const n = String(nubi || '').toUpperCase();
+  return (n === 'BKN' || n === 'OVC') ? 'velato' : 'sole';
+}
+
+/** Un indice a caselle di 0,25°: trovare le vicine di 14.000 stazioni senza confrontarle tutte con tutte. */
+export function indiceVicine(stazioni, lato = 0.25) {
+  const caselle = new Map();
+  const chiave = (a, b) => a + ':' + b;
+  stazioni.forEach((s, i) => {
+    const k = chiave(Math.floor(s.la / lato), Math.floor(s.lo / lato));
+    let lista = caselle.get(k);
+    if (!lista) { lista = []; caselle.set(k, lista); }
+    lista.push(i);
+  });
+  return {
+    attorno(la, lo) {
+      const ca = Math.floor(la / lato), cb = Math.floor(lo / lato), fuori = [];
+      for (let a = ca - 1; a <= ca + 1; a++) for (let b = cb - 1; b <= cb + 1; b++) {
+        const lista = caselle.get(chiave(a, b));
+        if (lista) fuori.push(...lista);
+      }
+      return fuori;
+    }
+  };
+}
+
+const vuotaP = () => [0, 0, -99];      /* [quante, somma, massimo] */
+const vuotaZ = () => [0, 0];           /* [quante, somma] */
+const giornoDi = ms => new Date(ms).toISOString().slice(0, 10);
+const giorniFra = (a, b) => Math.round((Date.parse(b + 'T12:00:00Z') - Date.parse(a + 'T12:00:00Z')) / 86400000);
+
+/** Le osservazioni vecchie pesano meno: metà dopo tre settimane. Si applica una volta al giorno. */
+export function invecchia(memoria, oggi) {
+  if (!memoria.decaduto) { memoria.decaduto = oggi; return 0; }
+  const giorni = giorniFra(memoria.decaduto, oggi);
+  if (!Number.isFinite(giorni) || giorni <= 0) return 0;
+  const k = Math.pow(0.5, giorni / REP_DIMEZZA_GIORNI);
+  let tolte = 0;
+  for (const id of Object.keys(memoria.st)) {
+    const st = memoria.st[id];
+    const eta = st.visto ? giorniFra(st.visto, oggi) : 999;
+    if (eta > REP_DIMENTICA_GIORNI) { delete memoria.st[id]; tolte++; continue; }
+    st.n = Number((st.n * k).toFixed(3));
+    for (const c of REP_CLASSI) {
+      if (st.p[c]) { st.p[c][0] = Number((st.p[c][0] * k).toFixed(3)); st.p[c][1] = Number((st.p[c][1] * k).toFixed(3)); }
+      if (st.z[c]) { st.z[c][0] = Number((st.z[c][0] * k).toFixed(3)); st.z[c][1] = Number((st.z[c][1] * k).toFixed(3)); }
+    }
+  }
+  memoria.decaduto = oggi;
+  return tolte;
+}
+
+/** Il giudizio su una stazione, dai suoi accumuli:
+ *   f  = errore fisso (quanto legge sopra le vicine col buio)
+ *   s  = eccesso col sole (quanto si scalda in più quando il sole batte, tolto l'errore fisso)
+ *   zf = quanto sta sopra l'aeroporto la ZONA attorno a lei, di notte (differenza vera del territorio)
+ *   q  = quanta fiducia meritano questi numeri, da 0 a 1
+ *   v  = 'buona' · 'sole' · 'alta' · 'bassa' · 'poco' */
+export function verdetto(st) {
+  const media = a => a && a[0] >= 1 ? a[1] / a[0] : NaN;
+  const nNotte = st.p.notte ? st.p.notte[0] : 0, nSole = st.p.sole ? st.p.sole[0] : 0;
+  const nGiorno = st.p.giorno ? st.p.giorno[0] : 0;
+  const f = nNotte >= REP_MIN_OSS ? media(st.p.notte) : NaN;
+  /* dove non c'è nessun aeroporto entro 120 km il cielo resta ignoto: allora, per l'eccesso col sole,
+     valgono le ore di giorno (ci sono dentro anche le giornate coperte, quindi il conto viene più
+     prudente e la fiducia più bassa) */
+  const perSole = nSole >= REP_MIN_OSS ? st.p.sole : (nGiorno >= 2 * REP_MIN_OSS ? st.p.giorno : null);
+  const conSole = perSole ? media(perSole) : NaN;
+  const nUsate = perSole ? perSole[0] : 0;
+  const s = Number.isFinite(conSole) ? conSole - (Number.isFinite(f) ? f : 0) : NaN;
+  const zf = st.z.notte && st.z.notte[0] >= REP_MIN_OSS ? media(st.z.notte) : NaN;
+  let v = 'poco';
+  if (Number.isFinite(s) && s >= 1.5) v = 'sole';
+  else if (Number.isFinite(f) && f >= 1.2) v = 'alta';
+  else if (Number.isFinite(f) && f <= -1.2) v = 'bassa';
+  else if (Number.isFinite(f) && Number.isFinite(s) && Math.abs(f) < 0.8 && s < 1) v = 'buona';
+  const q = Math.min(1, nNotte / 10) * 0.5 + Math.min(1, nUsate / 10) * (nSole >= REP_MIN_OSS ? 0.5 : 0.3);
+  return { f, s, zf, q: Number(q.toFixed(2)), v };
+}
+
+/** Un giro di osservazioni: aggiorna la memoria con le letture di adesso. Non tocca niente
+ *  di quello che l'app usa; torna solo i conti di quello che ha imparato. */
+export function osserva(stazioni, aerop, memoria, adessoMs = Date.now()) {
+  const adessoS = adessoMs / 1000, oggi = giornoDi(adessoMs);
+  const conti = { fresche: 0, imparate: 0, ripetute: 0, poche: 0, guaste: 0, conAeroporto: 0, conCielo: 0, nuove: 0, invecchiate: 0 };
+  if (!memoria.st) memoria.st = {};
+  conti.invecchiate = invecchia(memoria, oggi);
+
+  const fresche = (stazioni || []).filter(s => s && Number.isFinite(Number(s.t)) && Number.isFinite(Number(s.la))
+    && Number.isFinite(Number(s.lo)) && Number.isFinite(Number(s.ts)) && adessoS - Number(s.ts) <= REP_FRESCHE_S);
+  conti.fresche = fresche.length;
+  if (fresche.length < REP_MIN_VICINE + 1) return conti;
+  const indice = indiceVicine(fresche);
+  const aerei = (aerop || []).filter(a => a && Number.isFinite(Number(a.t)) && Number.isFinite(Number(a.la))
+    && Number.isFinite(Number(a.ts)) && adessoS - Number(a.ts) <= REP_AERO_MAX_S);
+
+  for (const s of fresche) {
+    const id = String(s.id || '');
+    if (!id) continue;
+    const st = memoria.st[id];
+    if (st && Number(st.ts) === Number(s.ts)) { conti.ripetute++; continue; }   /* la stessa lettura di prima: non si conta due volte */
+
+    /* le vicine, riportate alla quota di questa stazione */
+    const alt = Number(s.alt);
+    const attorno = [];
+    for (const i of indice.attorno(Number(s.la), Number(s.lo))) {
+      const v = fresche[i];
+      if (v === s || String(v.id) === id) continue;
+      if (distanzaKm(Number(s.la), Number(s.lo), Number(v.la), Number(v.lo)) > REP_RAGGIO_KM) continue;
+      const av = Number(v.alt);
+      const dq = Number.isFinite(av) && Number.isFinite(alt) && Math.abs(av - alt) <= REP_QUOTA_MAX ? av - alt : 0;
+      attorno.push(Number(v.t) + REP_GRADIENTE * dq);
+    }
+    if (attorno.length < REP_MIN_VICINE) { conti.poche++; continue; }
+    const medV = medianaRep(attorno);
+    const p = Number(s.t) - medV;
+    if (!Number.isFinite(p) || Math.abs(p) > REP_MAX_SCARTO) { conti.guaste++; continue; }
+
+    /* l'aeroporto più vicino: entro 60 km serve da metro per la differenza di zona, entro 120 km
+       basta comunque a dire se c'era il sole o era coperto (le nuvole sono una faccenda regionale) */
+    let aero = null, dMin = Infinity;
+    for (const a of aerei) {
+      const d = distanzaKm(Number(s.la), Number(s.lo), Number(a.la), Number(a.lo));
+      if (d < dMin && d <= REP_CIELO_KM) { dMin = d; aero = a; }
+    }
+    let z = NaN, nubi = '';
+    if (aero) {
+      nubi = aero.nubi || '';
+      conti.conCielo++;
+      if (dMin <= REP_AERO_KM) {
+        const qa = Number.isFinite(Number(aero.q)) ? Number(aero.q) : QUOTE_AERO[String(aero.icao || '').toUpperCase()];
+        const aeroT = Number(aero.t) - (Number.isFinite(qa) && Number.isFinite(alt) ? REP_GRADIENTE * (alt - qa) : 0);
+        z = medV - aeroT;                     /* quanto la zona sta sopra l'aeroporto: differenza vera del territorio */
+        conti.conAeroporto++;
+      }
+    }
+
+    const classe = classeCielo(altezzaSole(Number(s.la), Number(s.lo), new Date(Number(s.ts) * 1000)), nubi, !!aero);
+    if (!classe) continue;                    /* alba o tramonto: non insegna niente di buono */
+
+    let voce = memoria.st[id];
+    if (!voce) {
+      voce = memoria.st[id] = { n: 0, ts: 0, dal: oggi, visto: oggi, p: {}, z: {} };
+      conti.nuove++;
+    }
+    voce.citta = s.citta || voce.citta || '';
+    voce.la = Number(s.la); voce.lo = Number(s.lo);
+    if (Number.isFinite(alt)) voce.alt = alt;
+    voce.ts = Number(s.ts); voce.visto = oggi; voce.n = Number((voce.n + 1).toFixed(3));
+    const pc = voce.p[classe] || (voce.p[classe] = vuotaP());
+    pc[0] = Number((pc[0] + 1).toFixed(3)); pc[1] = Number((pc[1] + p).toFixed(3)); pc[2] = Math.max(pc[2], Number(p.toFixed(2)));
+    if (Number.isFinite(z)) {
+      const zc = voce.z[classe] || (voce.z[classe] = vuotaZ());
+      zc[0] = Number((zc[0] + 1).toFixed(3)); zc[1] = Number((zc[1] + z).toFixed(3));
+    }
+    conti.imparate++;
+  }
+  memoria.aggiornato = adessoMs;
+  return conti;
+}
+
+/** La memoria pronta da scrivere, cella per cella, con i verdetti già calcolati. */
+export function perCella(memoria, adessoMs = Date.now()) {
+  const celle = {};
+  const arr = (a, quanti) => a ? a.slice(0, quanti).map(v => Number(Number(v).toFixed(2))) : undefined;
+  for (const id of Object.keys(memoria.st || {})) {
+    const st = memoria.st[id];
+    if (!Number.isFinite(st.la) || !Number.isFinite(st.lo)) continue;
+    const k = Math.floor(st.la) + '_' + Math.floor(st.lo);
+    const g = verdetto(st);
+    const fuori = { n: Number(st.n.toFixed(1)), ts: st.ts, dal: st.dal, visto: st.visto,
+                    la: Number(st.la.toFixed(4)), lo: Number(st.lo.toFixed(4)), p: {}, z: {}, q: g.q, v: g.v };
+    if (st.citta) fuori.citta = st.citta;
+    if (Number.isFinite(st.alt)) fuori.alt = st.alt;
+    if (Number.isFinite(g.f)) fuori.f = Number(g.f.toFixed(2));
+    if (Number.isFinite(g.s)) fuori.s = Number(g.s.toFixed(2));
+    if (Number.isFinite(g.zf)) fuori.zf = Number(g.zf.toFixed(2));
+    for (const c of REP_CLASSI) {
+      if (st.p[c] && st.p[c][0] > 0) fuori.p[c] = arr(st.p[c], 3);
+      if (st.z[c] && st.z[c][0] > 0) fuori.z[c] = arr(st.z[c], 2);
+    }
+    (celle[k] = celle[k] || {})[id] = fuori;
+  }
+  const fuori = {};
+  for (const k of Object.keys(celle)) fuori[k] = { aggiornato: adessoMs, versione: REP_VERSIONE,
+    decaduto: memoria.decaduto || '', stazioni: celle[k] };
+  return fuori;
+}
+
+/** Il contrario: dai file per cella alla memoria unica del ponte. */
+export function daCelle(file) {
+  const memoria = { versione: REP_VERSIONE, decaduto: '', aggiornato: 0, st: {} };
+  for (const contenuto of file) {
+    if (!contenuto || Number(contenuto.versione) !== REP_VERSIONE || !contenuto.stazioni) continue;
+    if (Number(contenuto.aggiornato) > memoria.aggiornato) memoria.aggiornato = Number(contenuto.aggiornato);
+    if (contenuto.decaduto && contenuto.decaduto > memoria.decaduto) memoria.decaduto = contenuto.decaduto;
+    for (const id of Object.keys(contenuto.stazioni)) {
+      const v = contenuto.stazioni[id];
+      const st = { n: Number(v.n) || 0, ts: Number(v.ts) || 0, dal: v.dal || '', visto: v.visto || '', citta: v.citta || '', p: {}, z: {} };
+      if (Number.isFinite(Number(v.alt))) st.alt = Number(v.alt);
+      if (Number.isFinite(Number(v.la))) st.la = Number(v.la);
+      if (Number.isFinite(Number(v.lo))) st.lo = Number(v.lo);
+      for (const c of REP_CLASSI) {
+        if (Array.isArray(v.p && v.p[c])) st.p[c] = [Number(v.p[c][0]) || 0, Number(v.p[c][1]) || 0, Number(v.p[c][2]) || -99];
+        if (Array.isArray(v.z && v.z[c])) st.z[c] = [Number(v.z[c][0]) || 0, Number(v.z[c][1]) || 0];
+      }
+      memoria.st[id] = st;
+    }
+  }
+  return memoria;
+}
+
+/* ————— i file della reputazione: uno per cella, accanto ai dati ————— */
+
+export function leggiReputazione(radice) {
+  const cartella = dir(radice, 'reputazione');
+  let nomi = [];
+  try { nomi = fs.readdirSync(cartella).filter(n => n.endsWith('.json')); } catch (_) { return daCelle([]); }
+  return daCelle(nomi.map(n => leggi(dir(cartella, n), null)));
+}
+
+export function scriviReputazione(radice, celle) {
+  const cartella = dir(radice, 'reputazione');
+  fs.rmSync(cartella, { recursive: true, force: true });
+  const nomi = Object.keys(celle);
+  for (const k of nomi) scrivi(dir(cartella, k + '.json'), celle[k]);
+  return nomi.length;
 }
 
 /* ————————————————— la scrittura ————————————————— */
@@ -453,9 +787,21 @@ export async function giro(amb = process.env, radice = process.cwd(), chiama = f
     a = prima && Array.isArray(prima.aeroporti) ? prima.aeroporti : [];
     registro.log(a.length ? '  ↻ aeroporti: servizio muto, riportate le ' + a.length + ' osservazioni del giro prima' : '  ⚠ aeroporti: nessuna osservazione');
   }
-  const conteggi = scriviTutto(radice, r.stazioni, a, { chiamate: r.chiamate, durataMs: Date.now() - t0 });
+  /* ponte 3 · la reputazione: si impara e si scrive, ma non cambia niente di quello che l'app usa oggi */
+  let rep = { imparate: 0, celle: 0 };
+  try {
+    const memoria = leggiReputazione(radice);
+    const conti = osserva(r.stazioni, a, memoria, Date.now());
+    rep.celle = scriviReputazione(radice, perCella(memoria, Date.now()));
+    rep.imparate = conti.imparate;
+    registro.log('  ✔ reputazione: ' + conti.imparate + ' letture nuove su ' + conti.fresche + ' fresche ('
+      + conti.nuove + ' stazioni mai viste, ' + conti.ripetute + ' letture già contate, ' + conti.poche + ' senza abbastanza vicine, '
+      + conti.guaste + ' fuori da ogni scala, ' + conti.conCielo + ' con il cielo noto, ' + conti.conAeroporto + ' con un aeroporto entro ' + REP_AERO_KM + ' km'
+      + (conti.invecchiate ? ', ' + conti.invecchiate + ' dimenticate perché sparite da un mese' : '') + ') → ' + rep.celle + ' celle');
+  } catch (e) { registro.log('  ⚠ reputazione: ' + e.message + ' (i dati delle stazioni non ne risentono)'); }
+  const conteggi = scriviTutto(radice, r.stazioni, a, { chiamate: r.chiamate, durataMs: Date.now() - t0, reputazione: rep.imparate });
   registro.log('  ✔ scritte ' + Object.keys(conteggi).length + ' celle in ' + Math.round((Date.now() - t0) / 1000) + ' s');
-  return { stazioni: r.stazioni.length, aeroporti: a.length, celle: Object.keys(conteggi).length, chiamate: r.chiamate };
+  return { stazioni: r.stazioni.length, aeroporti: a.length, celle: Object.keys(conteggi).length, chiamate: r.chiamate, imparate: rep.imparate };
 }
 
 export function stessoFile(indirizzoModulo, lanciato, piattaforma = process.platform) {
