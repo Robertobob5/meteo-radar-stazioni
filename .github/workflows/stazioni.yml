@@ -9,6 +9,12 @@
 # stanno nelle impostazioni del repository: nell'app non entra niente.
 # Il gettone rinnovato vive cifrato in stato/netatmo.enc sul ramo "dati".
 #
+# PONTE 3 (8 settembre 2026): oltre alle letture, ogni giro aggiorna la
+# REPUTAZIONE di ogni stazione (quanto legge rispetto alle vicine, di notte e
+# col sole, e quanto la sua zona sta sopra l'aeroporto). Sono somme che si
+# accumulano, quindi vanno riprese dal ramo "dati" a ogni avvio e ripubblicate
+# insieme al resto: la cartella "reputazione". L'app di oggi non la guarda.
+#
 # PERCHÉ SI RILANCIA DA SOLO, E SUBITO. GitHub non garantisce gli avvii
 # programmati (il 3 settembre ne ha saltati sette su otto), e ogni tanto
 # spegne un runner a metà lavoro ("The operation was canceled", run #8,
@@ -83,7 +89,11 @@ jobs:
             # prima dove Netatmo oggi non risponde
             git checkout FETCH_HEAD -- celle 2>/dev/null || true
             git reset -q -- celle 2>/dev/null || true
-            echo "stato recuperato ($(ls celle 2>/dev/null | wc -l) celle del giro prima)"
+            # ponte 3: la reputazione delle stazioni si accumula da un giro all'altro,
+            # quindi va ripresa da qui (senza, ogni giro ripartirebbe da zero)
+            git checkout FETCH_HEAD -- reputazione 2>/dev/null || true
+            git reset -q -- reputazione 2>/dev/null || true
+            echo "stato recuperato ($(ls celle 2>/dev/null | wc -l) celle e $(ls reputazione 2>/dev/null | wc -l) celle di reputazione del giro prima)"
           else
             echo "primo giro: nessuno stato"
           fi
@@ -97,6 +107,7 @@ jobs:
           pubblica() {
             rm -rf /tmp/pub && mkdir -p /tmp/pub
             cp -r celle /tmp/pub/ 2>/dev/null || true
+            cp -r reputazione /tmp/pub/ 2>/dev/null || true
             cp aeroporti.json indice.json mattonelle.json /tmp/pub/ 2>/dev/null || true
             mkdir -p /tmp/pub/stato && cp stato/netatmo.enc /tmp/pub/stato/ 2>/dev/null || true
             cd /tmp/pub
