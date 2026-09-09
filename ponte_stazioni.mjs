@@ -53,6 +53,16 @@
    mezzanotte quasi zero: una media sola avrebbe sbagliato in tutte e due i
    momenti. La zona si annota anche nel crepuscolo, dove invece il sensore
    non insegna niente di suo.
+
+   PONTE 3.2 (9 settembre 2026): SI CONTANO LE NOTTI, NON LE LETTURE. Una
+   lettura ogni venti minuti fa cinque "osservazioni" in meno di due ore:
+   l'errore fisso di un sensore usciva dopo una notte sola, e una notte
+   può essere strana (vento, nebbia, un temporale). Ora per ogni stazione e
+   per ogni classe si contano anche le NOTTI (o i giorni) distinte in cui è
+   stata vista, e l'errore fisso, l'eccesso col sole e i verdetti escono
+   solo da tre notti (o tre giorni) in su. I file restano leggibili dalle
+   app v72.2 e v72.3 così come sono: chi non ha ancora tre notti
+   semplicemente non ha il campo "f", e non viene corretto.
    ════════════════════════════════════════════════════════════════ */
 
 import fs from 'node:fs';
@@ -476,6 +486,8 @@ export const REP_NOTTE = -4;            /* gradi sotto l'orizzonte: da qui in gi
 export const REP_DIMEZZA_GIORNI = 21;   /* le osservazioni vecchie pesano metà dopo tre settimane */
 export const REP_MIN_OSS = 5;           /* osservazioni in una classe, per dire qualcosa */
 export const REP_MAX_SCARTO = 15;       /* oltre, non è una stazione al sole: è rotta, e non insegna niente */
+export const REP_MIN_PERIODI = 3;       /* ponte 3.2: notti (o giorni) distinte in cui la stazione è stata vista, prima di giudicarla */
+export const REP_LETTURE_PER_NOTTE = 24; /* ponte 3.2: per i file vecchi, senza il conto delle notti: una notte ≈ 24 letture (una ogni 20 minuti) */
 export const REP_DIMENTICA_GIORNI = 30; /* non vista da un mese: si toglie dalla memoria */
 export const REP_CLASSI = ['notte', 'velato', 'sole', 'giorno'];
 /* ponte 3.1 · la differenza di zona non è una cosa sola: all'alba, quando l'aria dei campi
@@ -565,7 +577,13 @@ export function indiceVicine(stazioni, lato = 0.25) {
   };
 }
 
-const vuotaP = () => [0, 0, -99];      /* [quante, somma, massimo] */
+const vuotaP = () => [0, 0, -99, 0, 0]; /* [quante, somma, massimo, notti o giorni distinti (3.2), ultimo periodo contato (3.2)] */
+/** ponte 3.2 · il "periodo" di una lettura: per la notte, la data della sera in cui è cominciata (da mezzogiorno a
+ *  mezzogiorno), così le 23:30 e le 02:30 sono la stessa notte; per il giorno, la data. In giorni dal 1970. */
+export function periodoDi(tsSecondi, classe) {
+  const ms = Number(tsSecondi) * 1000;
+  return Math.floor((classe === 'notte' ? ms - 12 * 3600000 : ms) / 86400000);
+}
 const vuotaZ = () => [0, 0];           /* [quante, somma] */
 const giornoDi = ms => new Date(ms).toISOString().slice(0, 10);
 const giorniFra = (a, b) => Math.round((Date.parse(b + 'T12:00:00Z') - Date.parse(a + 'T12:00:00Z')) / 86400000);
@@ -583,6 +601,7 @@ export function invecchia(memoria, oggi) {
     if (eta > REP_DIMENTICA_GIORNI) { delete memoria.st[id]; tolte++; continue; }
     st.n = Number((st.n * k).toFixed(3));
     for (const c of REP_CLASSI) {
+      /* ponte 3.2: il conto delle notti (o giorni) distinti NON invecchia: è una storia, non un peso; chi sparisce da un mese esce comunque */
       if (st.p[c]) { st.p[c][0] = Number((st.p[c][0] * k).toFixed(3)); st.p[c][1] = Number((st.p[c][1] * k).toFixed(3)); }
       if (st.z[c]) { st.z[c][0] = Number((st.z[c][0] * k).toFixed(3)); st.z[c][1] = Number((st.z[c][1] * k).toFixed(3)); }
     }
@@ -600,13 +619,16 @@ export function invecchia(memoria, oggi) {
  *   v  = 'buona' · 'sole' · 'alta' · 'bassa' · 'poco' */
 export function verdetto(st) {
   const media = a => a && a[0] >= 1 ? a[1] / a[0] : NaN;
+  const periodi = a => a && a.length > 3 && Number.isFinite(a[3]) ? a[3] : 0;   /* ponte 3.2: notti o giorni distinti */
   const nNotte = st.p.notte ? st.p.notte[0] : 0, nSole = st.p.sole ? st.p.sole[0] : 0;
   const nGiorno = st.p.giorno ? st.p.giorno[0] : 0;
-  const f = nNotte >= REP_MIN_OSS ? media(st.p.notte) : NaN;
+  const notti = periodi(st.p.notte);
+  const f = nNotte >= REP_MIN_OSS && notti >= REP_MIN_PERIODI ? media(st.p.notte) : NaN;
   /* dove non c'è nessun aeroporto entro 120 km il cielo resta ignoto: allora, per l'eccesso col sole,
      valgono le ore di giorno (ci sono dentro anche le giornate coperte, quindi il conto viene più
      prudente e la fiducia più bassa) */
-  const perSole = nSole >= REP_MIN_OSS ? st.p.sole : (nGiorno >= 2 * REP_MIN_OSS ? st.p.giorno : null);
+  const perSole = nSole >= REP_MIN_OSS && periodi(st.p.sole) >= REP_MIN_PERIODI ? st.p.sole
+                : (nGiorno >= 2 * REP_MIN_OSS && periodi(st.p.giorno) >= REP_MIN_PERIODI ? st.p.giorno : null);
   const conSole = perSole ? media(perSole) : NaN;
   const nUsate = perSole ? perSole[0] : 0;
   const s = Number.isFinite(conSole) ? conSole - (Number.isFinite(f) ? f : 0) : NaN;
@@ -617,14 +639,14 @@ export function verdetto(st) {
   else if (Number.isFinite(f) && f <= -1.2) v = 'bassa';
   else if (Number.isFinite(f) && Number.isFinite(s) && Math.abs(f) < 0.8 && s < 1) v = 'buona';
   const q = Math.min(1, nNotte / 10) * 0.5 + Math.min(1, nUsate / 10) * (nSole >= REP_MIN_OSS ? 0.5 : 0.3);
-  return { f, s, zf, q: Number(q.toFixed(2)), v };
+  return { f, s, zf, q: Number(q.toFixed(2)), v, notti: Number(notti.toFixed(1)), giorni: Number(periodi(perSole).toFixed(1)) };
 }
 
 /** Un giro di osservazioni: aggiorna la memoria con le letture di adesso. Non tocca niente
  *  di quello che l'app usa; torna solo i conti di quello che ha imparato. */
 export function osserva(stazioni, aerop, memoria, adessoMs = Date.now()) {
   const adessoS = adessoMs / 1000, oggi = giornoDi(adessoMs);
-  const conti = { fresche: 0, imparate: 0, zone: 0, ripetute: 0, poche: 0, guaste: 0, conAeroporto: 0, conCielo: 0, nuove: 0, invecchiate: 0 };
+  const conti = { fresche: 0, imparate: 0, zone: 0, ripetute: 0, poche: 0, guaste: 0, conAeroporto: 0, conCielo: 0, nuove: 0, invecchiate: 0, periodi: 0 };
   if (!memoria.st) memoria.st = {};
   conti.invecchiate = invecchia(memoria, oggi);
 
@@ -703,6 +725,10 @@ export function osserva(stazioni, aerop, memoria, adessoMs = Date.now()) {
     voce.n = Number((voce.n + 1).toFixed(3));
     const pc = voce.p[classe] || (voce.p[classe] = vuotaP());
     pc[0] = Number((pc[0] + 1).toFixed(3)); pc[1] = Number((pc[1] + p).toFixed(3)); pc[2] = Math.max(pc[2], Number(p.toFixed(2)));
+    /* ponte 3.2 · una notte (o un giorno) nuova conta una volta sola, per quante letture porti */
+    const periodo = periodoDi(s.ts, classe);
+    if (pc.length < 5) { pc[3] = pc[3] || 0; pc[4] = pc[4] || 0; }
+    if (pc[4] !== periodo) { pc[3] = Number((pc[3] + 1).toFixed(3)); pc[4] = periodo; conti.periodi++; }
     if (Number.isFinite(z)) {
       const zc = voce.z[classe] || (voce.z[classe] = vuotaZ());
       zc[0] = Number((zc[0] + 1).toFixed(3)); zc[1] = Number((zc[1] + z).toFixed(3));
@@ -729,8 +755,10 @@ export function perCella(memoria, adessoMs = Date.now()) {
     if (Number.isFinite(g.f)) fuori.f = Number(g.f.toFixed(2));
     if (Number.isFinite(g.s)) fuori.s = Number(g.s.toFixed(2));
     if (Number.isFinite(g.zf)) fuori.zf = Number(g.zf.toFixed(2));
+    fuori.notti = g.notti;                                    /* ponte 3.2: notti distinte viste (e giorni, per il sole) */
+    if (g.giorni > 0) fuori.giorni = g.giorni;
     for (const c of REP_CLASSI) {
-      if (st.p[c] && st.p[c][0] > 0) fuori.p[c] = arr(st.p[c], 3);
+      if (st.p[c] && st.p[c][0] > 0) fuori.p[c] = arr(st.p[c], 5);
       if (st.z[c] && st.z[c][0] > 0) fuori.z[c] = arr(st.z[c], 2);
     }
     fuori.zb = {};
@@ -757,7 +785,12 @@ export function daCelle(file) {
       if (Number.isFinite(Number(v.la))) st.la = Number(v.la);
       if (Number.isFinite(Number(v.lo))) st.lo = Number(v.lo);
       for (const c of REP_CLASSI) {
-        if (Array.isArray(v.p && v.p[c])) st.p[c] = [Number(v.p[c][0]) || 0, Number(v.p[c][1]) || 0, Number(v.p[c][2]) || -99];
+        if (Array.isArray(v.p && v.p[c])) {
+          const a = v.p[c], n = Number(a[0]) || 0;
+          /* ponte 3.2 · i file di prima non hanno il conto delle notti: si stima dalle letture (una notte ≈ 24), e da qui in poi si conta davvero */
+          const periodi = a.length > 3 && Number.isFinite(Number(a[3])) ? Number(a[3]) : Math.floor(n / REP_LETTURE_PER_NOTTE);
+          st.p[c] = [n, Number(a[1]) || 0, Number(a[2]) || -99, periodi, a.length > 4 ? Number(a[4]) || 0 : 0];
+        }
         if (Array.isArray(v.z && v.z[c])) st.z[c] = [Number(v.z[c][0]) || 0, Number(v.z[c][1]) || 0];
       }
       st.zb = {};
@@ -832,7 +865,7 @@ export async function giro(amb = process.env, radice = process.cwd(), chiama = f
     const conti = osserva(r.stazioni, a, memoria, Date.now());
     rep.celle = scriviReputazione(radice, perCella(memoria, Date.now()));
     rep.imparate = conti.imparate;
-    registro.log('  ✔ reputazione: ' + conti.imparate + ' letture nuove su ' + conti.fresche + ' fresche, ' + conti.zone + ' con la differenza di zona ('
+    registro.log('  ✔ reputazione: ' + conti.imparate + ' letture nuove su ' + conti.fresche + ' fresche, ' + conti.periodi + ' notti/giorni nuovi, ' + conti.zone + ' con la differenza di zona ('
       + conti.nuove + ' stazioni mai viste, ' + conti.ripetute + ' letture già contate, ' + conti.poche + ' senza abbastanza vicine, '
       + conti.guaste + ' fuori da ogni scala, ' + conti.conCielo + ' con il cielo noto, ' + conti.conAeroporto + ' con un aeroporto entro ' + REP_AERO_KM + ' km'
       + (conti.invecchiate ? ', ' + conti.invecchiate + ' dimenticate perché sparite da un mese' : '') + ') → ' + rep.celle + ' celle');
