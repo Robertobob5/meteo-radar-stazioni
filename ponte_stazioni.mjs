@@ -45,6 +45,14 @@
    "reputazione/<cella>.json" accanto ai dati: l'app di oggi non li guarda,
    li userà la v72.2 per correggere i sensori starati e scartare quelli
    che stanno al sole. Le letture pubblicate per l'app NON cambiano.
+
+   PONTE 3.1 (9 settembre 2026): la differenza di zona si misura per FASCE
+   di altezza del sole (cuore della notte · prima notte e alba · crepuscolo ·
+   sole basso · sole alto), non più come una media unica. All'alba del 9
+   settembre a Ozzano il paese stava quattro gradi sopra Borgo Panigale, a
+   mezzanotte quasi zero: una media sola avrebbe sbagliato in tutte e due i
+   momenti. La zona si annota anche nel crepuscolo, dove invece il sensore
+   non insegna niente di suo.
    ════════════════════════════════════════════════════════════════ */
 
 import fs from 'node:fs';
@@ -470,6 +478,19 @@ export const REP_MIN_OSS = 5;           /* osservazioni in una classe, per dire 
 export const REP_MAX_SCARTO = 15;       /* oltre, non è una stazione al sole: è rotta, e non insegna niente */
 export const REP_DIMENTICA_GIORNI = 30; /* non vista da un mese: si toglie dalla memoria */
 export const REP_CLASSI = ['notte', 'velato', 'sole', 'giorno'];
+/* ponte 3.1 · la differenza di zona non è una cosa sola: all'alba, quando l'aria dei campi
+   aperti dell'aeroporto si è raffreddata per irraggiamento e i muri del paese restituiscono
+   ancora il calore del giorno prima, il paese può stare tre gradi sopra; a mezzanotte mezzo
+   grado; col sole alto quasi niente. Quindi si misura per fasce di altezza del sole. */
+export const REP_BANDE = ['n2', 'n1', 'c', 'g1', 'g2'];
+export function fasciaSole(h) {
+  if (!Number.isFinite(h)) return null;
+  if (h <= -15) return 'n2';          /* cuore della notte */
+  if (h <= REP_NOTTE) return 'n1';    /* prima notte e fine notte */
+  if (h < REP_SOLE_ALTO) return 'c';  /* crepuscolo: alba e tramonto */
+  if (h <= 25) return 'g1';           /* sole basso */
+  return 'g2';                        /* sole alto */
+}
 
 /** quota (m) degli aeroporti con METAR, per chi non la manda nell'osservazione */
 export const QUOTE_AERO = { LIPE: 37, LIMC: 234, LIML: 103, LIRF: 3, LIRA: 130, LICC: 12, LIPZ: 2, LIRN: 88, LIMF: 301, LIME: 238,
@@ -565,6 +586,7 @@ export function invecchia(memoria, oggi) {
       if (st.p[c]) { st.p[c][0] = Number((st.p[c][0] * k).toFixed(3)); st.p[c][1] = Number((st.p[c][1] * k).toFixed(3)); }
       if (st.z[c]) { st.z[c][0] = Number((st.z[c][0] * k).toFixed(3)); st.z[c][1] = Number((st.z[c][1] * k).toFixed(3)); }
     }
+    for (const b of REP_BANDE) if (st.zb && st.zb[b]) { st.zb[b][0] = Number((st.zb[b][0] * k).toFixed(3)); st.zb[b][1] = Number((st.zb[b][1] * k).toFixed(3)); }
   }
   memoria.decaduto = oggi;
   return tolte;
@@ -602,7 +624,7 @@ export function verdetto(st) {
  *  di quello che l'app usa; torna solo i conti di quello che ha imparato. */
 export function osserva(stazioni, aerop, memoria, adessoMs = Date.now()) {
   const adessoS = adessoMs / 1000, oggi = giornoDi(adessoMs);
-  const conti = { fresche: 0, imparate: 0, ripetute: 0, poche: 0, guaste: 0, conAeroporto: 0, conCielo: 0, nuove: 0, invecchiate: 0 };
+  const conti = { fresche: 0, imparate: 0, zone: 0, ripetute: 0, poche: 0, guaste: 0, conAeroporto: 0, conCielo: 0, nuove: 0, invecchiate: 0 };
   if (!memoria.st) memoria.st = {};
   conti.invecchiate = invecchia(memoria, oggi);
 
@@ -655,18 +677,30 @@ export function osserva(stazioni, aerop, memoria, adessoMs = Date.now()) {
       }
     }
 
-    const classe = classeCielo(altezzaSole(Number(s.la), Number(s.lo), new Date(Number(s.ts) * 1000)), nubi, !!aero);
-    if (!classe) continue;                    /* alba o tramonto: non insegna niente di buono */
+    const altezza = altezzaSole(Number(s.la), Number(s.lo), new Date(Number(s.ts) * 1000));
+    const classe = classeCielo(altezza, nubi, !!aero);
+    const banda = fasciaSole(altezza);
+    /* nel crepuscolo il sensore non insegna niente di suo (si sta scaldando o raffreddando), ma la
+       differenza fra la zona e l'aeroporto è comunque una misura buona: quella si annota sempre */
+    if (!classe && !(banda && Number.isFinite(z))) continue;
 
     let voce = memoria.st[id];
     if (!voce) {
-      voce = memoria.st[id] = { n: 0, ts: 0, dal: oggi, visto: oggi, p: {}, z: {} };
+      voce = memoria.st[id] = { n: 0, ts: 0, dal: oggi, visto: oggi, p: {}, z: {}, zb: {} };
       conti.nuove++;
     }
+    if (!voce.zb) voce.zb = {};
     voce.citta = s.citta || voce.citta || '';
     voce.la = Number(s.la); voce.lo = Number(s.lo);
     if (Number.isFinite(alt)) voce.alt = alt;
-    voce.ts = Number(s.ts); voce.visto = oggi; voce.n = Number((voce.n + 1).toFixed(3));
+    voce.ts = Number(s.ts); voce.visto = oggi;
+    if (Number.isFinite(z) && banda) {
+      const zb = voce.zb[banda] || (voce.zb[banda] = vuotaZ());
+      zb[0] = Number((zb[0] + 1).toFixed(3)); zb[1] = Number((zb[1] + z).toFixed(3));
+      conti.zone++;
+    }
+    if (!classe) continue;                    /* alba o tramonto: sul sensore non si impara */
+    voce.n = Number((voce.n + 1).toFixed(3));
     const pc = voce.p[classe] || (voce.p[classe] = vuotaP());
     pc[0] = Number((pc[0] + 1).toFixed(3)); pc[1] = Number((pc[1] + p).toFixed(3)); pc[2] = Math.max(pc[2], Number(p.toFixed(2)));
     if (Number.isFinite(z)) {
@@ -699,6 +733,8 @@ export function perCella(memoria, adessoMs = Date.now()) {
       if (st.p[c] && st.p[c][0] > 0) fuori.p[c] = arr(st.p[c], 3);
       if (st.z[c] && st.z[c][0] > 0) fuori.z[c] = arr(st.z[c], 2);
     }
+    fuori.zb = {};
+    for (const b of REP_BANDE) if (st.zb && st.zb[b] && st.zb[b][0] > 0) fuori.zb[b] = arr(st.zb[b], 2);
     (celle[k] = celle[k] || {})[id] = fuori;
   }
   const fuori = {};
@@ -716,7 +752,7 @@ export function daCelle(file) {
     if (contenuto.decaduto && contenuto.decaduto > memoria.decaduto) memoria.decaduto = contenuto.decaduto;
     for (const id of Object.keys(contenuto.stazioni)) {
       const v = contenuto.stazioni[id];
-      const st = { n: Number(v.n) || 0, ts: Number(v.ts) || 0, dal: v.dal || '', visto: v.visto || '', citta: v.citta || '', p: {}, z: {} };
+      const st = { n: Number(v.n) || 0, ts: Number(v.ts) || 0, dal: v.dal || '', visto: v.visto || '', citta: v.citta || '', p: {}, z: {}, zb: {} };
       if (Number.isFinite(Number(v.alt))) st.alt = Number(v.alt);
       if (Number.isFinite(Number(v.la))) st.la = Number(v.la);
       if (Number.isFinite(Number(v.lo))) st.lo = Number(v.lo);
@@ -724,6 +760,8 @@ export function daCelle(file) {
         if (Array.isArray(v.p && v.p[c])) st.p[c] = [Number(v.p[c][0]) || 0, Number(v.p[c][1]) || 0, Number(v.p[c][2]) || -99];
         if (Array.isArray(v.z && v.z[c])) st.z[c] = [Number(v.z[c][0]) || 0, Number(v.z[c][1]) || 0];
       }
+      st.zb = {};
+      for (const b of REP_BANDE) if (Array.isArray(v.zb && v.zb[b])) st.zb[b] = [Number(v.zb[b][0]) || 0, Number(v.zb[b][1]) || 0];
       memoria.st[id] = st;
     }
   }
@@ -794,7 +832,7 @@ export async function giro(amb = process.env, radice = process.cwd(), chiama = f
     const conti = osserva(r.stazioni, a, memoria, Date.now());
     rep.celle = scriviReputazione(radice, perCella(memoria, Date.now()));
     rep.imparate = conti.imparate;
-    registro.log('  ✔ reputazione: ' + conti.imparate + ' letture nuove su ' + conti.fresche + ' fresche ('
+    registro.log('  ✔ reputazione: ' + conti.imparate + ' letture nuove su ' + conti.fresche + ' fresche, ' + conti.zone + ' con la differenza di zona ('
       + conti.nuove + ' stazioni mai viste, ' + conti.ripetute + ' letture già contate, ' + conti.poche + ' senza abbastanza vicine, '
       + conti.guaste + ' fuori da ogni scala, ' + conti.conCielo + ' con il cielo noto, ' + conti.conAeroporto + ' con un aeroporto entro ' + REP_AERO_KM + ' km'
       + (conti.invecchiate ? ', ' + conti.invecchiate + ' dimenticate perché sparite da un mese' : '') + ') → ' + rep.celle + ' celle');
