@@ -230,8 +230,13 @@ export function snellisci(s) {
       }
       if (m.rain_60min !== undefined || m.rain_live !== undefined) {
         const r1 = Number(m.rain_60min), rl = Number(m.rain_live);
+        /* "pio" = i millimetri dell'ULTIMA ORA: dice se ha piovuto qui di recente.
+           "piol" = quello che il secchiello sta raccogliendo ADESSO, dove la stazione
+           lo manda. Sono due domande diverse — "ha piovuto?" e "sta piovendo?" — e
+           alla v72.6 dell'app serve soprattutto la seconda. */
         if (Number.isFinite(r1)) fuori.pio = arrotonda(r1, 1);
         else if (Number.isFinite(rl)) fuori.pio = arrotonda(rl, 1);
+        if (Number.isFinite(rl)) fuori.piol = arrotonda(rl, 1);
         if (Number.isFinite(Number(m.rain_timeutc))) fuori.tsp = Number(m.rain_timeutc);
       }
       if (m.wind_strength !== undefined) {
@@ -242,7 +247,12 @@ export function snellisci(s) {
         if (Number.isFinite(Number(m.wind_timeutc))) fuori.tsv = Number(m.wind_timeutc);
       }
     }
-    if (fuori.t === undefined) return null;          /* senza temperatura non serve a niente */
+    /* ponte 3.3 · prima si buttava ogni colonnina senza termometro, e con lei se ne andava
+       il suo pluviometro: ma sono due sensori diversi, in due posti diversi della stessa
+       casa, e il secchiello sa una cosa che il termometro non sa — se l'acqua tocca terra.
+       Adesso basta uno dei due. Chi ha solo il secchiello serve alla pioggia e non entra
+       nella reputazione, che vive sulla temperatura (il filtro c'è già più avanti). */
+    if (fuori.t === undefined && fuori.pio === undefined && fuori.piol === undefined) return null;
     return fuori;
   } catch (_) { return null; }
 }
