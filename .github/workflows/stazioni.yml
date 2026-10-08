@@ -24,6 +24,16 @@
 # oppure entro un minuto, se questo viene ucciso. Prima di prenotare si
 # controlla che non ci sia già un giro in coda, così non si raddoppia mai.
 # L'orario programmato resta come rete di sicurezza in più.
+#
+# PONTE 3.3 (8 ottobre 2026): I METAR SI RINFRESCANO OGNI 6 MINUTI. Il giro
+# lungo legge gli aeroporti una volta ogni ~23 minuti (Netatmo non si può
+# chiedere più spesso), ma il bollettino nasce ogni 30 minuti e poteva
+# arrivare all'app anche 35 minuti dopo: l'8 ottobre alle 12:39, con la
+# pioggia addosso, l'app aveva in mano un bollettino "scaduto" e quello
+# nuovo non era ancora arrivato. Ora, nella pausa di 18 minuti fra un giro
+# e l'altro, ogni 6 minuti ponte_aeroporti.mjs chiede SOLO i METAR (una
+# chiamata, nessun segreto) e si pubblica soltanto se c'è un'osservazione
+# nuova. Netatmo, le celle e la reputazione: come prima.
 name: Stazioni vicine
 
 on:
@@ -137,7 +147,17 @@ jobs:
             else
               echo "giro $giro fallito: si riprova al prossimo"
             fi
-            if [ "$giro" -lt 3 ]; then sleep 1080; fi
+            if [ "$giro" -lt 3 ]; then
+              # ponte 3.3: nella pausa di 18 minuti (3 × 6) si rinfrescano SOLO i METAR;
+              # si pubblica soltanto se ponte_aeroporti.mjs risponde "cambiato" (uscita 0)
+              for passo in 1 2 3; do
+                sleep 360
+                echo "── rinfresco aeroporti $giro.$passo ──"
+                if timeout 90 node ponte_aeroporti.mjs; then
+                  pubblica
+                fi
+              done
+            fi
           done
 
       - name: Controllo finale della prenotazione
