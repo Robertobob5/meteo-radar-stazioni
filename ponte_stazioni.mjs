@@ -82,6 +82,23 @@
      NETATMO_REFRESH_TOKEN, se c'è ed è diverso;
    · l'errore si scrive pulito (di una pagina HTML resta il titolo, dei
      gettoni niente) anche in PONTE_ERRORE, per l'allarme.
+
+   PONTE 3.5 (15 ottobre 2026): RACCOLTE A ORARI FISSI. Netatmo concede
+   500 richieste l'ora per utente (e 50 ogni 10 secondi). Le raccolte
+   partivano a 23 minuti l'una dall'altra dentro un lavoro e a 5 minuti a
+   cavallo fra un lavoro e il successivo: dal 12 al 15 ottobre l'ora mobile
+   è arrivata a 631 richieste. Ora le raccolte cadono a orari fissi, tre
+   l'ora, ogni 20 minuti (ORARI_MINUTI): ogni giro aspetta il suo prossimo
+   orario libero, l'ultimo orario fatto si segna in stato/orario.json (e si
+   pubblica PRIMA di raccogliere), così due raccolte non cadono mai nello
+   stesso orario, neanche fra un lavoro e il successivo; un orario saltato
+   non si recupera. Ogni richiesta a Netatmo (gettone e ritentativi
+   compresi) si annota in stato/chiamate.json, e un tetto sull'ora mobile
+   (TETTO_ORARIO, 480) resta come rete di sicurezza: prima di ogni
+   mattonella si guarda l'ora mobile in quel momento, e in condizioni
+   normali non scatta mai. Se l'ora è già carica, la raccolta comincia da
+   dove si era fermato l'ultimo taglio, così il taglio gira per tutta
+   Italia invece di cadere sempre sulle ultime mattonelle (il Nord).
    ════════════════════════════════════════════════════════════════ */
 
 import fs from 'node:fs';
@@ -447,13 +464,102 @@ export const mattonelleDiPartenza = () => {
   return fuori;
 };
 
+/* ————————————————— Netatmo: il tetto sull'ora mobile (ponte 3.5) ————————————————— */
+
+export const TETTO_ORARIO = 480;          /* rete di sicurezza: Netatmo ne concede 500 l'ora; con gli orari fissi non si arriva mai qui */
+export const ORA_MS = 3600 * 1000;
+const FILE_CHIAMATE = ['stato', 'chiamate.json'];
+
+/** Gli istanti (ms) delle richieste a Netatmo dell'ultima ora, da stato/chiamate.json. */
+export function leggiChiamate(radice, adesso = Date.now()) {
+  const j = leggi(dir(radice, ...FILE_CHIAMATE), null);
+  const t = j && Array.isArray(j.t) ? j.t.map(Number).filter(Number.isFinite) : [];
+  return t.filter(x => x > adesso - ORA_MS && x <= adesso + 60000).sort((a, b) => a - b);
+}
+
+/** La memoria della rete di sicurezza: da quale mattonella si era fermato l'ultimo taglio,
+ *  e se l'ultima raccolta è stata tagliata. */
+export function leggiRete(radice) {
+  const j = leggi(dir(radice, ...FILE_CHIAMATE), null) || {};
+  return { partenza: Number.isInteger(j.partenza) && j.partenza > 0 ? j.partenza : 0, tagliata: j.tagliata === true };
+}
+
+export function scriviChiamate(radice, istanti, adesso = Date.now(), rete = leggiRete(radice)) {
+  scrivi(dir(radice, ...FILE_CHIAMATE), { versione: 1, t: istanti.filter(x => x > adesso - ORA_MS), partenza: rete.partenza, tagliata: !!rete.tagliata });
+}
+
+/* ————————————————— gli orari fissi delle raccolte (ponte 3.5) ————————————————— */
+
+export const ORARI_MINUTI = [5, 25, 45];             /* tre raccolte l'ora, ogni 20 minuti (minuti dell'orologio: uguali in ora italiana) */
+export const ORARIO_TOLLERANZA_MS = 5 * 60 * 1000;   /* un orario si può ancora cominciare fino a 5 minuti dopo; più tardi è saltato */
+const FILE_ORARIO = ['stato', 'orario.json'];
+
+/** Il primo orario fisso uguale o successivo all'istante ms. */
+export function primoOrarioDa(ms) {
+  for (let h = Math.floor(ms / ORA_MS) * ORA_MS; ; h += ORA_MS)
+    for (const m of ORARI_MINUTI) { const o = h + m * 60000; if (o >= ms) return o; }
+}
+
+/** L'ultimo orario fatto, da stato/orario.json (0 se non ce n'è). */
+export function ultimoOrario(radice) {
+  const j = leggi(dir(radice, ...FILE_ORARIO), null);
+  return j && Number.isFinite(Number(j.ultimo)) ? Number(j.ultimo) : 0;
+}
+
+/** Il prossimo orario libero: dopo l'ultimo fatto, e non passato da più della tolleranza (niente recuperi). */
+export function prossimoOrario(radice, adesso = Date.now()) {
+  return primoOrarioDa(Math.max(ultimoOrario(radice) + 1, adesso - ORARIO_TOLLERANZA_MS));
+}
+
+export class OrarioSaltato extends Error {}
+
+/** Il massimo di richieste cadute in una finestra lunga finestraMs. */
+export function massimoIn(istanti, finestraMs) {
+  const t = [...istanti].sort((a, b) => a - b);
+  let max = 0;
+  for (let i = 0, j = 0; j < t.length; j++) {
+    while (t[j] - t[i] >= finestraMs) i++;
+    max = Math.max(max, j - i + 1);
+  }
+  return max;
+}
+
+/** Una "chiama" che annota ogni richiesta a Netatmo prima di farla (gettone e ritentativi compresi). */
+export function contaChiamate(chiama, istanti, orologio = Date.now) {
+  return (indirizzo, opzioni) => {
+    if (/^https:\/\/api\.netatmo\.com\//.test(String(indirizzo))) istanti.push(orologio());
+    return chiama(indirizzo, opzioni);
+  };
+}
+
+/** Le richieste a Netatmo dell'ultima ora mobile. */
+export function usateNellOra(istanti, adesso = Date.now()) {
+  return istanti.filter(x => x > adesso - ORA_MS).length;
+}
+
+/** La rete di sicurezza, prima di ogni mattonella: si chiede solo se, anche coi suoi tentativi,
+ *  l'ultima ora resta entro TETTO_ORARIO. È esatta perché guarda l'ora mobile in quel momento,
+ *  quando le richieste di un'ora fa sono già uscite. */
+export function puoChiamare(istanti, adesso = Date.now()) {
+  return usateNellOra(istanti, adesso) + TENTATIVI <= TETTO_ORARIO;
+}
+
+/** Una raccolta è a rischio di taglio se le richieste che resteranno nell'ora mobile per tutta
+ *  la sua durata (al massimo DURATA_MAX_MS), più una raccolta intera, superano la rete. Solo
+ *  allora (o se la raccolta prima è stata tagliata) parte dal punto dove si era fermato l'ultimo
+ *  taglio; altrimenti dalla prima mattonella, come sempre. */
+export const DURATA_MAX_MS = 10 * 60 * 1000;    /* la raccolta più lenta vista dal 12 al 15 ottobre: 9,2 minuti */
+export function aRischio(istanti, adesso = Date.now()) {
+  return istanti.filter(x => x > adesso + DURATA_MAX_MS - ORA_MS).length + TETTO_CHIAMATE > TETTO_ORARIO;
+}
+
 /** Tutte le stazioni d'Italia, a mattonelle adattive e con un tetto di chiamate.
  *  L'albero delle mattonelle vive in mattonelle.json: le spezzate non si
  *  richiedono (si scende ai figli), le vuote si saltano per un giorno, quelle
  *  che non toccano l'Italia non si guardano nemmeno. Il tetto si può passare
  *  più basso (ponte 3.4: quando si riparte con un gettone nuovo, quello che
  *  resta del giro), mai più alto. */
-export async function raccogli(tok, radice, chiama, adesso = Date.now(), registro = console, pausa = attendi, tetto = TETTO_CHIAMATE) {
+export async function raccogli(tok, radice, chiama, adesso = Date.now(), registro = console, pausa = attendi, tetto = TETTO_CHIAMATE, partenza = 0, rete = null) {
   tetto = Math.min(tetto, TETTO_CHIAMATE);
   const fileMatt = dir(radice, 'mattonelle.json');
   let memoria = leggi(fileMatt, {});
@@ -468,6 +574,16 @@ export async function raccogli(tok, radice, chiama, adesso = Date.now(), registr
     coda.push(m);
   };
   mattonelleDiPartenza().forEach(scendi);
+  /* ponte 3.5 · ogni mattonella ricorda il suo posto nella lista (le figlie quello della madre);
+     una raccolta a rischio di taglio (rete.ruota) comincia da dove si era fermato l'ultimo taglio,
+     così il taglio gira per tutta Italia. Le raccolte normali partono sempre dalla prima. */
+  coda.forEach((m, i) => { m.posto = i; });
+  if (rete && rete.ruota && coda.length && partenza % coda.length) {
+    const k = partenza % coda.length;
+    coda.push(...coda.splice(0, k));
+    registro.log('  · ora già carica: comincio dalla mattonella ' + k + ' di ' + coda.length + ', dove si era fermato l\'ultimo taglio');
+  }
+  let prossimaPartenza = null;
 
   const stazioni = new Map();
   const mattonelleFallite = [];
@@ -477,7 +593,14 @@ export async function raccogli(tok, radice, chiama, adesso = Date.now(), registr
     const k = chiaveM(m);
     const nota = memoria[k];
     if (nota && nota.dentro === 0 && adesso - nota.ts < VUOTA_VALIDA_MS) { saltate++; continue; }   /* mare, o montagna deserta */
-    if (chiamate >= tetto) { registro.log('  · tetto di ' + tetto + ' chiamate raggiunto: il resto al prossimo giro'); break; }
+    const perRete = !!(rete && !rete.puo());
+    if (chiamate >= tetto || perRete) {
+      registro.log(perRete ? '  ⚠ rete di sicurezza: ' + rete.usate() + ' richieste a Netatmo nell\'ultima ora, mi fermo qui: il resto al prossimo giro'
+                           : '  · tetto di ' + tetto + ' chiamate raggiunto: il resto al prossimo giro');
+      if (perRete) prossimaPartenza = m.posto;
+      coda.unshift(m);
+      break;
+    }
     let esito;
     try { esito = await mattonella(tok, m, chiama, pausa); }
     catch (e) {
@@ -496,7 +619,7 @@ export async function raccogli(tok, radice, chiama, adesso = Date.now(), registr
     if ((dentro >= SOGLIA_DENTRO || grezze.length >= RISPOSTA_SOSPETTA) && lato / 2 >= MATTONELLA_MIN) {
       /* fitta (o risposta sospetta di taglio): si spezza in quattro e si rifà subito */
       spezzate++;
-      coda.unshift(...figli(m).filter(f => toccaItalia(f) || (fuori++, false)));
+      coda.unshift(...figli(m).filter(f => toccaItalia(f) || (fuori++, false)).map(f => Object.assign(f, { posto: m.posto })));
       memoria[k] = { n: grezze.length, dentro, ts: adesso, spezzata: 1 };
     } else {
       memoria[k] = { n: grezze.length, dentro, ts: adesso };
@@ -512,7 +635,7 @@ export async function raccogli(tok, radice, chiama, adesso = Date.now(), registr
   /* chi è rimasto in coda per il tetto o per lo stop non è stato letto: vale come fallito,
      così le sue letture del giro prima vengono riportate */
   for (const m of coda) mattonelleFallite.push(m);
-  return { stazioni: [...stazioni.values()], chiamate, spezzate, saltate, fuori, ritentate, fallite, mattonelleFallite, fermato, fermatoMsg };
+  return { stazioni: [...stazioni.values()], chiamate, spezzate, saltate, fuori, ritentate, fallite, mattonelleFallite, fermato, fermatoMsg, prossimaPartenza };
 }
 
 /* ————————————————— il riporto delle letture del giro prima ————————————————— */
@@ -980,12 +1103,53 @@ export function scriviTutto(radice, stazioni, aerop, meta, adesso = Date.now()) 
 /* ————————————————— il giro completo ————————————————— */
 
 export async function giro(amb = process.env, radice = process.cwd(), chiama = fetch, registro = console, pausa = attendi, alSalvataggio = null) {
+  /* ponte 3.5 · ogni richiesta a Netatmo si annota; le annotazioni si salvano anche se il giro fallisce */
+  const istanti = leggiChiamate(radice);
+  const memoria = leggiRete(radice);
+  const t0 = Date.now();
+  try {
+    return await giroContato(amb, radice, contaChiamate(chiama, istanti), registro, pausa, alSalvataggio, istanti, memoria);
+  } finally {
+    const mie = istanti.filter(x => x >= t0);
+    if (mie.length) registro.log('  · richieste a Netatmo: ' + mie.length + ' in questo giro, ' + usateNellOra(istanti)
+      + ' nell\'ultima ora (rete di sicurezza a ' + TETTO_ORARIO + '), al massimo ' + massimoIn(mie, 10000) + ' in 10 secondi');
+    try { scriviChiamate(radice, istanti, Date.now(), memoria); } catch (e) { registro.log('  ⚠ stato/chiamate.json non scritto: ' + e.message); }
+  }
+}
+
+/** La rete di sicurezza di una raccolta: se può chiedere ancora, quante ne ha usate l'ora, e se
+ *  deve partire da dove si era fermato l'ultimo taglio (ora già carica, o raccolta prima tagliata). */
+function reteDi(istanti, registro, memoria) {
+  const rischio = aRischio(istanti);
+  const rete = { puo: () => puoChiamare(istanti), usate: () => usateNellOra(istanti), ruota: rischio || memoria.tagliata };
+  if (rischio) registro.log('  ⚠ rete di sicurezza: ' + usateNellOra(istanti) + ' richieste a Netatmo nell\'ultima ora, la raccolta potrebbe non starci');
+  return rete;
+}
+
+/** Dopo una raccolta: se la rete l'ha tagliata, si ricorda dove. */
+function ricordaTaglio(memoria, r) {
+  memoria.tagliata = r.prossimaPartenza !== null;
+  if (memoria.tagliata) memoria.partenza = r.prossimaPartenza;
+}
+
+async function giroContato(amb, radice, chiama, registro, pausa, alSalvataggio, istanti, memoria) {
   const t0 = Date.now();
   registro.log('Ponte stazioni · ' + new Date().toISOString());
+  /* ponte 3.5 · l'orario fisso di questa raccolta: si segna e si pubblica PRIMA di cominciare,
+     così nessun altro giro (neanche del lavoro dopo, se questo muore a metà) lo rifà */
+  const orario = Number(amb.PONTE_ORARIO) > 0 ? Number(amb.PONTE_ORARIO) * 1000 : 0;
+  if (orario) {
+    if (orario <= ultimoOrario(radice)) throw new OrarioSaltato('l\'orario delle ' + oraItaliana(orario) + ' è già stato fatto');
+    if (Date.now() > orario + ORARIO_TOLLERANZA_MS) throw new OrarioSaltato('l\'orario delle ' + oraItaliana(orario) + ' è passato da più di 5 minuti: si salta, senza recuperi');
+    scrivi(dir(radice, ...FILE_ORARIO), { ultimo: orario, ora: oraItaliana(orario) });
+    registro.log('  · raccolta delle ' + oraItaliana(orario));
+    if (alSalvataggio) await alSalvataggio();
+  }
   let g = await assicuraGettone(amb, radice, chiama, { registro, alSalvataggio });
   registro.log(descriviGettone(g));
   const precedenti = lettureprecedenti(radice);          /* prima che scriviTutto le cancelli */
-  let r = await raccogli(g.tok, radice, chiama, Date.now(), registro, pausa);
+  let r = await raccogli(g.tok, radice, chiama, Date.now(), registro, pausa, TETTO_CHIAMATE, memoria.partenza, reteDi(istanti, registro, memoria));
+  ricordaTaglio(memoria, r);
   if (g.fonte === 'salvato' && (r.fermato === 401 || r.fermato === 403) && !r.stazioni.length) {
     /* ponte 3.4 · il gettone d'accesso salvato non vale più prima del tempo: si rinnova
        una volta e si riparte, con le chiamate che restano (il tetto del giro non cambia) */
@@ -993,7 +1157,8 @@ export async function giro(amb = process.env, radice = process.cwd(), chiama = f
     try {
       g = await assicuraGettone(amb, radice, chiama, { registro, alSalvataggio, forza: true });
       registro.log(descriviGettone(g));
-      const r2 = await raccogli(g.tok, radice, chiama, Date.now(), registro, pausa, TETTO_CHIAMATE - r.chiamate);
+      const r2 = await raccogli(g.tok, radice, chiama, Date.now(), registro, pausa, TETTO_CHIAMATE - r.chiamate, memoria.partenza, reteDi(istanti, registro, memoria));
+      ricordaTaglio(memoria, r2);
       r2.chiamate += r.chiamate;
       r = r2;
     } catch (e) {
@@ -1043,7 +1208,10 @@ export function stessoFile(indirizzoModulo, lanciato, piattaforma = process.plat
   return pari(io, chiamato) || vincee.basename(chiamato).toLowerCase() === vincee.basename(io).toLowerCase();
 }
 
-if (stessoFile(import.meta.url, process.argv[1])) {
+if (stessoFile(import.meta.url, process.argv[1]) && process.argv[2] === '--prossimo-orario') {
+  /* ponte 3.5 · il workflow chiede quando cade la prossima raccolta (secondi dal 1970) */
+  console.log(Math.floor(prossimoOrario(process.cwd()) / 1000));
+} else if (stessoFile(import.meta.url, process.argv[1])) {
   const segreti = [process.env.NETATMO_CLIENT_ID, process.env.NETATMO_CLIENT_SECRET, process.env.NETATMO_REFRESH_TOKEN];
   /* ponte 3.4 · l'ultima riga d'errore, senza segreti, per l'allarme di fine lavoro */
   const annota = riga => { if (process.env.PONTE_ERRORE) try { fs.appendFileSync(process.env.PONTE_ERRORE, senzaSegreti(riga, segreti) + '\n'); } catch (_) {} };
@@ -1054,5 +1222,8 @@ if (stessoFile(import.meta.url, process.argv[1])) {
   } : null;
   giro(process.env, process.cwd(), fetch, console, attendi, pubblicaSubito)
     .then(r => { if (r.fermato) annota('⚠ ' + r.fermato + ' (giro finito con le letture riportate)'); console.log('Fatto:', JSON.stringify(r)); })
-    .catch(e => { const riga = '✘ ' + senzaSegreti(e.message, segreti); console.log(riga); annota(riga); process.exit(1); });
+    .catch(e => {
+      if (e instanceof OrarioSaltato) { console.log('  · ' + e.message); process.exit(4); }   /* non è un errore: si passa all'orario dopo */
+      const riga = '✘ ' + senzaSegreti(e.message, segreti); console.log(riga); annota(riga); process.exit(1);
+    });
 }

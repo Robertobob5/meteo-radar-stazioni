@@ -84,3 +84,32 @@ Il gettone non va mai incollato in una chat, in una issue o in un file.
 
 Al giro dopo il lavoro vede che il gettone salvato non vale più, usa questo,
 lo salva cifrato e la issue si chiude da sola quando le stazioni tornano fresche.
+
+## Orari fissi, rete di sicurezza e prova dell'allarme (ponte 3.5)
+
+Netatmo concede 500 richieste l'ora per utente (e 50 ogni 10 secondi). Le
+raccolte partivano a 23 minuti l'una dall'altra dentro un lavoro e a 5 minuti a
+cavallo fra due lavori: dal 12 al 15 ottobre l'ora mobile è arrivata a 631.
+
+Ora le raccolte cadono a **orari fissi, tre l'ora: ai minuti :05, :25 e :45**.
+Ogni giro aspetta il suo prossimo orario libero (nell'attesa, ogni 6 minuti, si
+rinfrescano i METAR); l'ultimo orario fatto si segna in `stato/orario.json` e si
+pubblica *prima* di raccogliere, così due raccolte non cadono mai nello stesso
+orario, neanche fra un lavoro e il successivo. Un orario saltato non si recupera.
+Un lavoro fa le raccolte che cominciano entro 50 minuti dalla sua partenza (di
+solito due) e dura una quarantina di minuti; gli orari dopo li fa il lavoro dopo,
+già prenotato.
+
+Ogni richiesta a Netatmo (gettone e ritentativi compresi) si annota in
+`stato/chiamate.json`. Prima di ogni mattonella una **rete di sicurezza** guarda
+l'ora mobile: se si andrebbe oltre **480**, la raccolta si ferma lì e il resto passa
+al giro dopo. Con gli orari fissi non scatta mai (sui giri dal 12 al 15 ottobre il
+picco sarebbe stato 464). Se scatta, la raccolta dopo comincia dalla mattonella
+dove si era fermato il taglio, così il taglio gira per tutta Italia invece di
+cadere sempre sul Nord; le raccolte normali partono sempre dalla prima.
+
+Per provare l'allarme senza aspettare un guasto: **Actions** → **Stazioni
+vicine** → **Run workflow** → accendi **prova_allarme** → **Run workflow**. Il
+lavoro apre la issue «Prova allarme ponte» (dallo stesso account dell'allarme
+vero, con la stessa menzione) e la chiude dopo 2 minuti, senza toccare le
+stazioni né il ramo `dati`. I giri che si prenotano da soli non la accendono mai.

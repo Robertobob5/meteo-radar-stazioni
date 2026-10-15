@@ -19,7 +19,14 @@
    ma Netatmo non manda più niente).
    Risponde sempre 0: non fa mai diventare rosso il lavoro.
 
+   PROVA (ponte 3.5): "node ponte_allarme.mjs --prova apri" apre la issue
+   «Prova allarme ponte», con la stessa menzione dell'allarme vero e dallo
+   stesso account (il bot del lavoro); "--prova chiudi" la chiude. Il
+   workflow lo fa solo se lo si lancia a mano con «prova_allarme» acceso,
+   e allora non tocca né le stazioni né il ramo dati.
+
    Uso: node ponte_allarme.mjs <cartella con indice.json, aeroporti.json, celle/>
+        node ponte_allarme.mjs --prova apri | chiudi
    Variabili: GITHUB_REPOSITORY, GITHUB_REPOSITORY_OWNER (menzionato nella
               issue, così la mail arriva), GH_TOKEN (permesso issues: write),
               PONTE_ERRORE (il file con le righe d'errore del giro),
@@ -31,6 +38,7 @@ import path from 'node:path';
 import { stessoFile, senzaSegreti, oraItaliana } from './ponte_stazioni.mjs';
 
 export const TITOLO = 'Ponte stazioni fermo';
+export const TITOLO_PROVA = 'Prova allarme ponte';
 export const FERME_DOPO_MS = 2 * 3600 * 1000;
 
 const leggi = f => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (_) { return null; } };
@@ -97,6 +105,53 @@ function testoIssue(s, adesso, errore, collegamento, menziona) {
   ].join('\n');
 }
 
+/** Le chiamate alle issue del repository, con un tempo massimo. */
+function apiGitHub(repo, token, chiama) {
+  return async (metodo, percorso, corpo) => {
+    const r = await chiama('https://api.github.com/repos/' + repo + percorso, {
+      method: metodo,
+      headers: { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28',
+                 'User-Agent': 'meteo-radar-ponte', 'Content-Type': 'application/json' },
+      body: corpo ? JSON.stringify(corpo) : undefined, signal: AbortSignal.timeout(20000) });
+    if (!r.ok) throw new Error(metodo + ' ' + percorso.split('?')[0] + ': HTTP ' + r.status);
+    return r.json();
+  };
+}
+
+/**
+ * La prova dell'allarme: 'apri' apre «Prova allarme ponte» (se non è già aperta),
+ * 'chiudi' chiude quelle aperte. Torna il numero della issue. Gli errori si lanciano:
+ * una prova che non riesce deve vedersi.
+ */
+export async function provaAllarme(azione, { repo, token, chiama = fetch, registro = console, menziona = '', collegamento = '' } = {}) {
+  if (!repo || !token) throw new Error('mancano GITHUB_REPOSITORY o GH_TOKEN');
+  const api = apiGitHub(repo, token, chiama);
+  const aperte = (await api('GET', '/issues?state=open&per_page=100')).filter(i => i && !i.pull_request && i.title === TITOLO_PROVA);
+  if (azione === 'apri') {
+    if (aperte.length) { registro.log('  · la prova #' + aperte[0].number + ' è già aperta'); return aperte[0].number; }
+    const nuova = await api('POST', '/issues', { title: TITOLO_PROVA, body: [
+      (menziona ? '@' + menziona + ' ' : '') + 'questa è una **prova** dell\'allarme del ponte, aperta dal lavoro «Stazioni vicine» '
+        + 'nello stesso modo dell\'allarme vero «Ponte stazioni fermo».',
+      '',
+      'Se ti è arrivata la mail di questa issue, ti arriverà anche quella dell\'allarme vero.',
+      '',
+      'Le stazioni e il ramo dati non sono stati toccati. La issue si chiude da sola fra 2 minuti.',
+      collegamento ? '\nIl giro di prova: ' + collegamento : ''].join('\n') });
+    registro.log('  ✔ aperta la issue di prova #' + nuova.number + ' «' + TITOLO_PROVA + '»');
+    return nuova.number;
+  }
+  if (azione === 'chiudi') {
+    if (!aperte.length) throw new Error('nessuna issue «' + TITOLO_PROVA + '» aperta da chiudere');
+    for (const i of aperte) {
+      await api('POST', '/issues/' + i.number + '/comments', { body: 'Prova finita: chiudo.' });
+      await api('PATCH', '/issues/' + i.number, { state: 'closed', state_reason: 'completed' });
+      registro.log('  ✔ chiusa la issue di prova #' + i.number);
+    }
+    return aperte[0].number;
+  }
+  throw new Error('azione di prova sconosciuta: ' + azione + ' (apri | chiudi)');
+}
+
 /**
  * Riassunto e allarme. Torna { aggiornato, lettura, aeroporti, ferme, riga, azione }
  * con azione: 'aperta' | 'già aperta' | 'chiusa' | 'nessuna' | 'errore'.
@@ -114,15 +169,7 @@ export async function sorveglia({ cartella, adesso = Date.now(), repo = '', toke
   const fuori = { ...s, riga, azione: 'nessuna' };
   if (!repo || !token) { registro.log('  · manca GITHUB_REPOSITORY o GH_TOKEN: le issue non le guardo'); return fuori; }
 
-  const api = async (metodo, percorso, corpo) => {
-    const r = await chiama('https://api.github.com/repos/' + repo + percorso, {
-      method: metodo,
-      headers: { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28',
-                 'User-Agent': 'meteo-radar-ponte', 'Content-Type': 'application/json' },
-      body: corpo ? JSON.stringify(corpo) : undefined, signal: AbortSignal.timeout(20000) });
-    if (!r.ok) throw new Error(metodo + ' ' + percorso.split('?')[0] + ': HTTP ' + r.status);
-    return r.json();
-  };
+  const api = apiGitHub(repo, token, chiama);
   try {
     const aperte = (await api('GET', '/issues?state=open&per_page=100')).filter(i => i && !i.pull_request && i.title === TITOLO);
     if (s.ferme && !aperte.length) {
@@ -157,10 +204,16 @@ if (stessoFile(import.meta.url, process.argv[1])) {
   const amb = process.env;
   const collegamento = amb.GITHUB_RUN_ID && amb.GITHUB_REPOSITORY
     ? (amb.GITHUB_SERVER_URL || 'https://github.com') + '/' + amb.GITHUB_REPOSITORY + '/actions/runs/' + amb.GITHUB_RUN_ID : '';
-  sorveglia({ cartella: process.argv[2] || '.', repo: amb.GITHUB_REPOSITORY || '', token: amb.GH_TOKEN || '',
-              errore: ultimoErrore(amb.PONTE_ERRORE), collegamento, riassunto: amb.GITHUB_STEP_SUMMARY || '',
-              menziona: amb.GITHUB_REPOSITORY_OWNER || '' })   /* la menzione fa arrivare la mail anche a chi non segue il repository */
-    .then(r => console.log('Allarme: ' + r.azione))
-    .catch(e => console.log('⚠ allarme: ' + senzaSegreti(e.message)))
-    .finally(() => process.exit(0));
+  if (process.argv[2] === '--prova') {
+    provaAllarme(process.argv[3], { repo: amb.GITHUB_REPOSITORY || '', token: amb.GH_TOKEN || '', menziona: amb.GITHUB_REPOSITORY_OWNER || '', collegamento })
+      .then(n => { console.log('Prova: issue #' + n); process.exit(0); })
+      .catch(e => { console.log('✘ prova dell\'allarme non riuscita: ' + senzaSegreti(e.message)); process.exit(1); });
+  } else {
+    sorveglia({ cartella: process.argv[2] || '.', repo: amb.GITHUB_REPOSITORY || '', token: amb.GH_TOKEN || '',
+                errore: ultimoErrore(amb.PONTE_ERRORE), collegamento, riassunto: amb.GITHUB_STEP_SUMMARY || '',
+                menziona: amb.GITHUB_REPOSITORY_OWNER || '' })   /* la menzione fa arrivare la mail anche a chi non segue il repository */
+      .then(r => console.log('Allarme: ' + r.azione))
+      .catch(e => console.log('⚠ allarme: ' + senzaSegreti(e.message)))
+      .finally(() => process.exit(0));
+  }
 }

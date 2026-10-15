@@ -53,12 +53,31 @@
 #   quando sono state aggiornate stazioni e aeroporti e, se le stazioni sono
 #   ferme da più di 2 ore, apre UNA issue «Ponte stazioni fermo» (e la chiude
 #   da sola quando tornano fresche). Il lavoro resta verde: niente mail ogni ora.
+#
+# PONTE 3.5 (15 ottobre 2026): ORARI FISSI E PROVA DELL'ALLARME. Netatmo
+# concede 500 richieste l'ora, e le raccolte (23 minuti l'una dall'altra in un
+# lavoro, 5 minuti a cavallo fra due lavori) arrivavano a 631. Ora le raccolte
+# cadono a orari fissi, tre l'ora (:05, :25, :45), e ogni lavoro fa quelle che
+# gli stanno nel tempo (di solito due): circa 370 richieste l'ora. Un tetto
+# sull'ora mobile a 480 resta come rete di sicurezza (stato/chiamate.json); se
+# scatta, il taglio gira per tutta Italia invece di cadere sempre sul Nord.
+# Lanciando il lavoro
+# a mano con «prova_allarme» acceso, il bot apre la issue «Prova allarme
+# ponte» e la chiude dopo 2 minuti, senza toccare le stazioni né il ramo dati:
+# quel giro ha un nome e una coda sua, così non scalza il giro vero in attesa.
+# I giri che si prenotano da soli non accendono mai la prova.
 name: Stazioni vicine
+run-name: ${{ inputs.prova_allarme && 'Prova allarme ponte' || 'Stazioni vicine' }}
 
 on:
   schedule:
     - cron: '9,39 * * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      prova_allarme:
+        description: "Solo la prova dell'allarme: il bot apre la issue «Prova allarme ponte» e la chiude dopo 2 minuti (stazioni e ramo dati non si toccano)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -66,7 +85,8 @@ permissions:
   issues: write     # ponte 3.4: l'allarme apre e chiude la issue «Ponte stazioni fermo»
 
 concurrency:
-  group: stazioni-vicine
+  # la prova dell'allarme ha una coda sua: non deve né aspettare né scalzare il giro vero
+  group: ${{ inputs.prova_allarme && 'prova-allarme' || 'stazioni-vicine' }}
   cancel-in-progress: false
 
 jobs:
@@ -78,13 +98,14 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Prenota il prossimo giro lungo
+        if: ${{ !inputs.prova_allarme }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           altri=0
           for stato in queued waiting pending requested; do
             n=$(gh run list --repo "${{ github.repository }}" --workflow "${{ github.workflow }}" --status "$stato" \
-                  --json databaseId --jq "[.[] | select(.databaseId != ${{ github.run_id }})] | length" 2>/dev/null || echo 0)
+                  --json databaseId,displayTitle --jq "[.[] | select(.databaseId != ${{ github.run_id }} and .displayTitle != \"Prova allarme ponte\")] | length" 2>/dev/null || echo 0)
             altri=$((altri + n))
           done
           if [ "$altri" -gt 0 ]; then
@@ -106,6 +127,7 @@ jobs:
           node-version: '22'
 
       - name: Recupera lo stato dal ramo dati
+        if: ${{ !inputs.prova_allarme }}
         env:
           PONTE_DATI: ${{ runner.temp }}/dati
         run: |
@@ -135,7 +157,8 @@ jobs:
             fi
           fi
 
-      - name: Tre giri di letture
+      - name: Giri di letture agli orari fissi
+        if: ${{ !inputs.prova_allarme }}
         env:
           NETATMO_CLIENT_ID: ${{ secrets.NETATMO_CLIENT_ID }}
           NETATMO_CLIENT_SECRET: ${{ secrets.NETATMO_CLIENT_SECRET }}
@@ -147,30 +170,64 @@ jobs:
           PONTE_PUBBLICA: ${{ github.workspace }}/pubblica.sh
           PONTE_ERRORE: ${{ runner.temp }}/errori.txt
         run: |
-          # ponte 3.4: si lavora dentro la cartella del ramo dati
+          # ponte 3.5: le raccolte cadono a orari fissi, tre l'ora (ai minuti :05, :25 e :45).
+          # Ogni giro aspetta il suo prossimo orario libero (lo dice ponte_stazioni.mjs, che
+          # ricorda in stato/orario.json l'ultimo fatto); nell'attesa, ogni 6 minuti, si
+          # rinfrescano SOLO i METAR (ponte 3.3). Un giro parte solo se il suo orario cade
+          # entro 50 minuti dall'inizio di questo passo: il più lento visto dura 9 minuti, e
+          # il lavoro ne ha 70. Gli orari dopo li fa il lavoro dopo, già prenotato.
           cd "$PONTE_DATI"
-          for giro in 1 2 3; do
-            echo "── giro $giro ──"
-            if node "$GITHUB_WORKSPACE/ponte_stazioni.mjs"; then
-              bash "$PONTE_PUBBLICA"
-            else
-              echo "giro $giro fallito: si riprova al prossimo"
-            fi
-            if [ "$giro" -lt 3 ]; then
-              # ponte 3.3: nella pausa di 18 minuti (3 × 6) si rinfrescano SOLO i METAR;
-              # si pubblica soltanto se ponte_aeroporti.mjs risponde "cambiato" (uscita 0)
-              for passo in 1 2 3; do
+          inizio=$(date +%s)
+          limite=$(( inizio + 50 * 60 ))
+          aspetta_fino() {
+            while :; do
+              resta=$(( $1 - $(date +%s) ))
+              [ "$resta" -le 0 ] && return 0
+              if [ "$resta" -gt 390 ]; then
                 sleep 360
-                echo "── rinfresco aeroporti $giro.$passo ──"
+                echo "── rinfresco aeroporti $(TZ=Europe/Rome date -d @"$(date +%s)" +%H:%M) ──"
                 if timeout 90 node "$GITHUB_WORKSPACE/ponte_aeroporti.mjs"; then
                   bash "$PONTE_PUBBLICA"
                 fi
-              done
+              else
+                sleep "$resta"
+              fi
+            done
+          }
+          tentato=""
+          while :; do
+            orario=$(node "$GITHUB_WORKSPACE/ponte_stazioni.mjs" --prossimo-orario) || orario=""
+            if [ -z "$orario" ]; then
+              echo "⚠ non so quando cade il prossimo orario: ci pensa il lavoro dopo"
+              break
+            fi
+            ora=$(TZ=Europe/Rome date -d @"$orario" +%H:%M)
+            if [ "$orario" -gt "$limite" ]; then
+              echo "il prossimo orario ($ora) tocca al lavoro dopo"
+              break
+            fi
+            if [ "$orario" = "$tentato" ]; then
+              # il giro si è rotto prima di segnare il suo orario: non lo si ritenta, si passa al dopo
+              echo "l'orario delle $ora è già stato tentato: passo al successivo"
+              aspetta_fino $(( orario + 5 * 60 + 1 ))
+              continue
+            fi
+            tentato="$orario"
+            aspetta_fino "$orario"
+            echo "── giro delle $ora ──"
+            esito=0
+            PONTE_ORARIO="$orario" node "$GITHUB_WORKSPACE/ponte_stazioni.mjs" || esito=$?
+            if [ "$esito" -eq 0 ]; then
+              bash "$PONTE_PUBBLICA"
+            elif [ "$esito" -eq 4 ]; then
+              echo "orario delle $ora saltato: si passa al successivo"
+            else
+              echo "giro delle $ora fallito: si riprova al prossimo orario"
             fi
           done
 
       - name: Riassunto e allarme
-        if: always()
+        if: ${{ always() && !inputs.prova_allarme }}
         env:
           GH_TOKEN: ${{ github.token }}
           PONTE_ERRORE: ${{ runner.temp }}/errori.txt
@@ -185,15 +242,25 @@ jobs:
             echo "⚠ il ramo dati non si legge adesso: riassunto e allarme al prossimo giro" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Prova dell'allarme
+        if: ${{ inputs.prova_allarme }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # la stessa strada dell'allarme vero: issue aperta dal bot, con la menzione
+          node ponte_allarme.mjs --prova apri
+          sleep 120
+          node ponte_allarme.mjs --prova chiudi
+
       - name: Controllo finale della prenotazione
-        if: always()
+        if: ${{ always() && !inputs.prova_allarme }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           altri=0
           for stato in queued waiting pending requested; do
             n=$(gh run list --repo "${{ github.repository }}" --workflow "${{ github.workflow }}" --status "$stato" \
-                  --json databaseId --jq "[.[] | select(.databaseId != ${{ github.run_id }})] | length" 2>/dev/null || echo 0)
+                  --json databaseId,displayTitle --jq "[.[] | select(.databaseId != ${{ github.run_id }} and .displayTitle != \"Prova allarme ponte\")] | length" 2>/dev/null || echo 0)
             altri=$((altri + n))
           done
           if [ "$altri" -gt 0 ]; then
