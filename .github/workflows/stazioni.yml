@@ -34,6 +34,25 @@
 # e l'altro, ogni 6 minuti ponte_aeroporti.mjs chiede SOLO i METAR (una
 # chiamata, nessun segreto) e si pubblica soltanto se c'è un'osservazione
 # nuova. Netatmo, le celle e la reputazione: come prima.
+#
+# PONTE 3.4 (15 ottobre 2026): NIENTE PIÙ ERRORI IN SILENZIO.
+# · Un giro fallito pubblicava gli aeroporti SENZA indice.json (si
+#   riprendevano dal ramo dati solo i file di un elenco, e lui non c'era):
+#   il 15 ottobre dalle 07:29 alle 07:56 il ramo è rimasto senza, e la
+#   carta dell'app è sparita. Ora il ramo dati si prende INTERO in una
+#   cartella a parte, i programmi lavorano lì e si ripubblica la cartella
+#   intera: quello che un giro non rifà resta com'era. Se il ramo c'è ma non
+#   si legge, niente giri (un ramo vuoto cancellerebbe la reputazione).
+# · Il gettone d'accesso Netatmo (3 ore) si tiene cifrato in
+#   stato/accesso.enc e si riusa: il rinnovo si chiede di rado. Un gettone
+#   di rinnovo nuovo si pubblica SUBITO (pubblica.sh), prima di raccogliere:
+#   il 14 ottobre il giro #1437 l'ha perso, troncato dal tempo massimo.
+# · Il tempo massimo passa da 58 a 70 minuti: tre giri lenti con le due
+#   pause arrivano a 59 minuti e il terzo veniva troncato prima di pubblicare.
+# · Alla fine di ogni giro lungo, ponte_allarme.mjs scrive nel riassunto
+#   quando sono state aggiornate stazioni e aeroporti e, se le stazioni sono
+#   ferme da più di 2 ore, apre UNA issue «Ponte stazioni fermo» (e la chiude
+#   da sola quando tornano fresche). Il lavoro resta verde: niente mail ogni ora.
 name: Stazioni vicine
 
 on:
@@ -44,6 +63,7 @@ on:
 permissions:
   contents: write
   actions: write
+  issues: write     # ponte 3.4: l'allarme apre e chiude la issue «Ponte stazioni fermo»
 
 concurrency:
   group: stazioni-vicine
@@ -52,7 +72,7 @@ concurrency:
 jobs:
   raccogli:
     runs-on: ubuntu-24.04
-    timeout-minutes: 58
+    timeout-minutes: 70
     steps:
       - name: Prendi il programma
         uses: actions/checkout@v5
@@ -86,26 +106,33 @@ jobs:
           node-version: '22'
 
       - name: Recupera lo stato dal ramo dati
+        env:
+          PONTE_DATI: ${{ runner.temp }}/dati
         run: |
-          mkdir -p stato
-          if git fetch --depth 1 origin dati 2>/dev/null; then
-            git show FETCH_HEAD:stato/netatmo.enc > stato/netatmo.enc 2>/dev/null || true
-            git show FETCH_HEAD:mattonelle.json > mattonelle.json 2>/dev/null || true
-            git show FETCH_HEAD:aeroporti.json > aeroporti.json 2>/dev/null || true
-            [ -s stato/netatmo.enc ] || rm -f stato/netatmo.enc
-            [ -s mattonelle.json ] || rm -f mattonelle.json
-            [ -s aeroporti.json ] || rm -f aeroporti.json
-            # le celle già pubblicate: servono a riportare le letture del giro
-            # prima dove Netatmo oggi non risponde
-            git checkout FETCH_HEAD -- celle 2>/dev/null || true
-            git reset -q -- celle 2>/dev/null || true
-            # ponte 3: la reputazione delle stazioni si accumula da un giro all'altro,
-            # quindi va ripresa da qui (senza, ogni giro ripartirebbe da zero)
-            git checkout FETCH_HEAD -- reputazione 2>/dev/null || true
-            git reset -q -- reputazione 2>/dev/null || true
-            echo "stato recuperato ($(ls celle 2>/dev/null | wc -l) celle e $(ls reputazione 2>/dev/null | wc -l) celle di reputazione del giro prima)"
+          # ponte 3.4: il ramo dati si prende INTERO in una cartella a parte, i programmi
+          # lavorano lì dentro e pubblica.sh ripubblica la cartella intera. Quello che un
+          # giro non rifà (indice.json quando il giro fallisce, la reputazione, lo stato,
+          # un file che domani ancora non c'è) resta com'era: niente più elenchi da ricordare.
+          rm -rf "$PONTE_DATI" && mkdir -p "$PONTE_DATI"
+          preso=no
+          for tentativo in 1 2 3; do
+            if git fetch -q --depth 1 origin dati 2>/dev/null; then preso=si; break; fi
+            echo "il ramo dati non risponde (tentativo $tentativo): riprovo fra 10 s"
+            sleep 10
+          done
+          if [ "$preso" = si ]; then
+            git archive FETCH_HEAD | tar -x -C "$PONTE_DATI"
+            echo "stato recuperato ($(ls "$PONTE_DATI/celle" 2>/dev/null | wc -l) celle e $(ls "$PONTE_DATI/reputazione" 2>/dev/null | wc -l) celle di reputazione del giro prima)"
           else
-            echo "primo giro: nessuno stato"
+            codice=0
+            git ls-remote --exit-code origin refs/heads/dati > /dev/null 2>&1 || codice=$?
+            if [ "$codice" -eq 2 ]; then
+              echo "primo giro: nessuno stato"
+            else
+              # un ramo vuoto pubblicato sopra quello vero cancellerebbe la reputazione di settimane
+              echo "::error::il ramo dati c'è ma adesso non si legge: niente giri, si riprova al prossimo"
+              exit 1
+            fi
           fi
 
       - name: Tre giri di letture
@@ -113,37 +140,19 @@ jobs:
           NETATMO_CLIENT_ID: ${{ secrets.NETATMO_CLIENT_ID }}
           NETATMO_CLIENT_SECRET: ${{ secrets.NETATMO_CLIENT_SECRET }}
           NETATMO_REFRESH_TOKEN: ${{ secrets.NETATMO_REFRESH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          PONTE_DATI: ${{ runner.temp }}/dati
+          # ponte 3.4: il programma chiama pubblica.sh appena salva un gettone di rinnovo
+          # nuovo (prima di raccogliere) e annota gli errori, senza segreti, per l'allarme
+          PONTE_PUBBLICA: ${{ github.workspace }}/pubblica.sh
+          PONTE_ERRORE: ${{ runner.temp }}/errori.txt
         run: |
-          pubblica() {
-            rm -rf /tmp/pub && mkdir -p /tmp/pub
-            cp -r celle /tmp/pub/ 2>/dev/null || true
-            cp -r reputazione /tmp/pub/ 2>/dev/null || true
-            cp aeroporti.json indice.json mattonelle.json /tmp/pub/ 2>/dev/null || true
-            mkdir -p /tmp/pub/stato && cp stato/netatmo.enc /tmp/pub/stato/ 2>/dev/null || true
-            cd /tmp/pub
-            git init -q -b dati
-            git config user.name "Meteo Radar"
-            git config user.email "stazioni@meteoradar.local"
-            git add -A
-            git commit -q -m "Letture del $(TZ=Europe/Rome date '+%d/%m/%Y %H:%M')"
-            # la spinta su GitHub può cadere per un attimo di rete: si riprova
-            for tentativo in 1 2 3; do
-              if git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" dati; then
-                cd "$GITHUB_WORKSPACE"
-                echo "pubblicato"
-                return 0
-              fi
-              echo "spinta su GitHub non riuscita (tentativo $tentativo)"
-              sleep 15
-            done
-            cd "$GITHUB_WORKSPACE"
-            echo "NON pubblicato: si riprova al prossimo giro"
-            return 0
-          }
+          # ponte 3.4: si lavora dentro la cartella del ramo dati
+          cd "$PONTE_DATI"
           for giro in 1 2 3; do
             echo "── giro $giro ──"
-            if node ponte_stazioni.mjs; then
-              pubblica
+            if node "$GITHUB_WORKSPACE/ponte_stazioni.mjs"; then
+              bash "$PONTE_PUBBLICA"
             else
               echo "giro $giro fallito: si riprova al prossimo"
             fi
@@ -153,12 +162,28 @@ jobs:
               for passo in 1 2 3; do
                 sleep 360
                 echo "── rinfresco aeroporti $giro.$passo ──"
-                if timeout 90 node ponte_aeroporti.mjs; then
-                  pubblica
+                if timeout 90 node "$GITHUB_WORKSPACE/ponte_aeroporti.mjs"; then
+                  bash "$PONTE_PUBBLICA"
                 fi
               done
             fi
           done
+
+      - name: Riassunto e allarme
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PONTE_ERRORE: ${{ runner.temp }}/errori.txt
+        run: |
+          # si guarda il ramo dati così com'è pubblicato: è quello che vede l'app
+          ultimi="$RUNNER_TEMP/ultimi"
+          rm -rf "$ultimi" && mkdir -p "$ultimi"
+          if git fetch -q --depth 1 origin dati 2>/dev/null && git archive FETCH_HEAD | tar -x -C "$ultimi"; then
+            node ponte_allarme.mjs "$ultimi" || true
+          else
+            # niente falsi allarmi per un attimo di rete: si guarda al giro dopo
+            echo "⚠ il ramo dati non si legge adesso: riassunto e allarme al prossimo giro" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Controllo finale della prenotazione
         if: always()

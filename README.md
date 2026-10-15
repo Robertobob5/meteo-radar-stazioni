@@ -11,6 +11,9 @@ segreto, nessuna chiave. I codici Netatmo stanno nei *Secrets* di questo
 repository e non escono mai da qui.
 
 - `ponte_stazioni.mjs` — il programma (Node, senza dipendenze)
+- `ponte_aeroporti.mjs` — il rinfresco dei soli METAR fra un giro e l'altro
+- `ponte_allarme.mjs` — il riassunto di fine lavoro e l'allarme (ponte 3.4)
+- `pubblica.sh` — la pubblicazione sul ramo `dati` (ponte 3.4)
 - ramo `dati` — le letture: `indice.json`, `aeroporti.json`, `celle/<lat>_<lon>.json`
   e la reputazione: `reputazione/<lat>_<lon>.json`
 
@@ -39,3 +42,45 @@ grezze da cui vengono. Serviranno all'app dalla v72.2 in poi.
 
 Le stazioni Netatmo sono centraline private: l'app usa la **mediana** delle
 più vicine e scarta i valori fuori scala; l'aeroporto resta la misura ufficiale.
+
+## Se il ponte si ferma (ponte 3.4)
+
+Il lavoro resta verde anche quando un giro fallisce (si riprova al giro dopo),
+quindi un errore non si vede dal colore. Per questo, alla fine di ogni giro
+lungo, `ponte_allarme.mjs`:
+
+- scrive nel riassunto del lavoro una riga come
+  «Stazioni: ultimo aggiornamento 15/10 07:56 (6 min fa) · Aeroporti: 15/10 07:59»;
+- se le stazioni sono ferme da più di 2 ore apre **una** issue
+  «Ponte stazioni fermo», con l'ultima riga d'errore (senza segreti): GitHub
+  manda una mail;
+- quando le stazioni tornano fresche la chiude da sola, con un commento.
+
+All'inizio di ogni lavoro il ramo `dati` si prende **intero** in una cartella
+a parte; i programmi lavorano lì dentro e `pubblica.sh` ripubblica la cartella
+intera. Quello che un giro non rifà (`indice.json` quando il giro fallisce, la
+reputazione, lo stato) resta com'era. Se il ramo c'è ma non si legge, il lavoro
+non fa giri: un ramo vuoto pubblicato sopra cancellerebbe la reputazione.
+
+Il gettone di rinnovo Netatmo vive cifrato in `stato/netatmo.enc` sul ramo
+`dati`, quello d'accesso (dura 3 ore) in `stato/accesso.enc`: il rinnovo si
+chiede solo quando quello d'accesso sta per scadere, e un gettone di rinnovo
+nuovo si pubblica subito, prima di raccogliere. Se Netatmo rifiuta il gettone
+salvato, il lavoro prova da solo il segreto `NETATMO_REFRESH_TOKEN`.
+
+### Se serve un gettone nuovo
+
+Solo se la issue dice `invalid_grant` o «serve un gettone nuovo nei Secrets».
+Il gettone non va mai incollato in una chat, in una issue o in un file.
+
+1. Apri **dev.netatmo.com** ed entra col tuo account.
+2. In alto: **My apps** → la tua app.
+3. Scendi a **Token generator**: scegli lo scope **read_station** e premi
+   **Generate token** (Netatmo chiede di autorizzare: conferma).
+4. Copia il **refresh token** (non l'access token).
+5. Su GitHub, repository **meteo-radar-stazioni** → **Settings** →
+   **Secrets and variables** → **Actions** → **NETATMO_REFRESH_TOKEN** →
+   **Update** → incolla → **Save**.
+
+Al giro dopo il lavoro vede che il gettone salvato non vale più, usa questo,
+lo salva cifrato e la issue si chiude da sola quando le stazioni tornano fresche.

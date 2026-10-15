@@ -63,11 +63,31 @@
    solo da tre notti (o tre giorni) in su. I file restano leggibili dalle
    app v72.2 e v72.3 così come sono: chi non ha ancora tre notti
    semplicemente non ha il campo "f", e non viene corretto.
+
+   PONTE 3.4 (15 ottobre 2026): IL GETTONE NON SI PERDE PIÙ, E SI CHIEDE
+   MENO. Il 14 ottobre (giro #1437) il terzo giro ha rinnovato il gettone
+   alle 09:04 ed è stato troncato alle 09:11 dal tempo massimo del lavoro,
+   prima di pubblicare: il gettone nuovo è andato perso (per fortuna
+   Netatmo accettava ancora il vecchio). Il 15 ottobre alle 07:17 (giro
+   #1469) il rinnovo ha avuto per tre volte un HTTP 403 con una pagina
+   HTML: non un rifiuto del gettone, un blocco a monte, e al giro dopo
+   lo stesso gettone è andato. Ora:
+   · il gettone d'ACCESSO (dura 3 ore) si tiene cifrato in
+     stato/accesso.enc e si riusa finché vale: il rinnovo si chiede una
+     volta ogni tre ore circa, non tre volte l'ora;
+   · un gettone di rinnovo nuovo si salva e si fa pubblicare SUBITO
+     (PONTE_PUBBLICA), prima di cominciare a raccogliere;
+   · se Netatmo RIFIUTA il gettone salvato (invalid_grant), o
+     stato/netatmo.enc non si decifra, si prova il segreto
+     NETATMO_REFRESH_TOKEN, se c'è ed è diverso;
+   · l'errore si scrive pulito (di una pagina HTML resta il titolo, dei
+     gettoni niente) anche in PONTE_ERRORE, per l'allarme.
    ════════════════════════════════════════════════════════════════ */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const ITALIA = { latMin: 35.4, latMax: 47.2, lonMin: 6.5, lonMax: 18.7 };
@@ -174,31 +194,139 @@ export function decifra(b64, segreto) {
 
 /* ————————————————— Netatmo: il gettone ————————————————— */
 
-export async function gettone(amb, radice, chiama) {
+/* Due gettoni, tutti e due cifrati col client secret in stato/ sul ramo dati:
+   · stato/netatmo.enc — il gettone di RINNOVO (refresh token), come sempre;
+   · stato/accesso.enc — il gettone d'ACCESSO e la sua scadenza (ponte 3.4).
+   Il rinnovo si chiede solo quando quello d'accesso sta per scadere. */
+export const ACCESSO_MARGINE_MS = 15 * 60 * 1000;   /* si rinnova quando mancano meno di 15 minuti: un giro ne dura al massimo 8 */
+export const ACCESSO_DURATA_S = 10800;              /* se Netatmo non dice quanto dura: 3 ore */
+const FILE_RINNOVO = ['stato', 'netatmo.enc'];
+const FILE_ACCESSO = ['stato', 'accesso.enc'];
+
+/** L'ora italiana di un istante: "15/10 07:56". */
+export function oraItaliana(ms) {
+  const p = {};
+  for (const x of new Intl.DateTimeFormat('it-IT', { timeZone: 'Europe/Rome', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+         .formatToParts(new Date(ms))) p[x.type] = x.value;
+  return p.day + '/' + p.month + ' ' + p.hour + ':' + p.minute;
+}
+
+/** Toglie da un testo tutto ciò che somiglia a un gettone o a una chiave: i segreti
+ *  passati, i gettoni Netatmo (<id>|<segreto>), i Bearer, le stringhe lunghe. */
+export function senzaSegreti(testo, segreti = []) {
+  let s = String(testo == null ? '' : testo);
+  for (const x of segreti) if (x && String(x).length >= 6) s = s.split(String(x)).join('[TOLTO]');
+  return s
+    .replace(/[A-Za-z0-9_\-]{8,}\|[A-Za-z0-9_\-]{8,}/g, '[TOLTO]')
+    .replace(/((?:access|refresh)_token["']?\s*[:=]\s*["']?)[^"'\s,&}]+/g, '$1[TOLTO]')   /* minuscolo: il nome del segreto NETATMO_REFRESH_TOKEN non è un gettone */
+    .replace(/(Bearer\s+)\S+/gi, '$1[TOLTO]')
+    .replace(/[A-Za-z0-9_\-]{32,}/g, '[TOLTO]');
+}
+
+/** Una risposta d'errore, corta e pulita: di una pagina HTML resta solo il titolo. */
+export function riassumiRisposta(testo, segreti = []) {
+  const t = String(testo || '');
+  if (/<\s*(!doctype|html)/i.test(t)) {
+    const m = t.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const titolo = m ? senzaSegreti(m[1].replace(/\s+/g, ' ').trim(), segreti).slice(0, 80) : '';
+    return 'pagina HTML' + (titolo ? ' «' + titolo + '»' : '') + ': non è una risposta di Netatmo sul gettone, è un blocco a monte';
+  }
+  return senzaSegreti(t.replace(/\s+/g, ' ').trim(), segreti).slice(0, 200);
+}
+
+/** Netatmo ha detto chiaro che QUEL gettone di rinnovo non vale più (scaduto, revocato, già usato)? */
+export function gettoneRespinto(status, testo) {
+  return status >= 400 && status < 500 && /invalid_grant/i.test(String(testo || ''));
+}
+
+/** Quello che c'è in stato/: { rinnovo, rinnovoGuasto (il file c'è ma non si decifra), accesso: { a, scade } } */
+export function leggiGettoni(radice, segreto) {
+  const fuori = { rinnovo: null, rinnovoGuasto: false, accesso: null };
+  const fr = dir(radice, ...FILE_RINNOVO);
+  if (fs.existsSync(fr)) {
+    try { fuori.rinnovo = decifra(fs.readFileSync(fr, 'utf8'), segreto) || null; } catch (_) { fuori.rinnovo = null; }
+    fuori.rinnovoGuasto = !fuori.rinnovo;
+  }
+  try {
+    const a = JSON.parse(decifra(fs.readFileSync(dir(radice, ...FILE_ACCESSO), 'utf8'), segreto));
+    if (a && typeof a.a === 'string' && a.a && Number.isFinite(a.scade)) fuori.accesso = a;
+  } catch (_) { /* manca o non si decifra: si rinnova */ }
+  return fuori;
+}
+
+/**
+ * Un gettone d'accesso valido, chiedendo il rinnovo a Netatmo solo se serve.
+ * opzioni: adesso, registro, forza (non fidarti di quello d'accesso salvato),
+ *          alSalvataggio (si chiama appena scritto un gettone di rinnovo nuovo,
+ *          PRIMA di raccogliere: il workflow lo pubblica subito su dati).
+ * Torna { tok, fonte: 'salvato' | 'rinnovato' | 'segreto', nuovoRinnovo, scade }.
+ */
+export async function assicuraGettone(amb, radice, chiama, opzioni = {}) {
+  const { adesso = Date.now(), registro = console, forza = false, alSalvataggio = null } = opzioni;
   const id = amb.NETATMO_CLIENT_ID, segreto = amb.NETATMO_CLIENT_SECRET;
   if (!id || !segreto) throw new Error('mancano NETATMO_CLIENT_ID / NETATMO_CLIENT_SECRET');
-  const fileStato = dir(radice, 'stato', 'netatmo.enc');
-  let rinnovo = null;
-  try { rinnovo = decifra(fs.readFileSync(fileStato, 'utf8'), segreto); } catch (_) { rinnovo = null; }
-  if (!rinnovo) rinnovo = amb.NETATMO_REFRESH_TOKEN || null;
-  if (!rinnovo) throw new Error('manca il refresh token (NETATMO_REFRESH_TOKEN, o stato/netatmo.enc)');
+  const st = leggiGettoni(radice, segreto);
+  if (!forza && st.accesso && st.accesso.scade - adesso > ACCESSO_MARGINE_MS)
+    return { tok: st.accesso.a, fonte: 'salvato', nuovoRinnovo: false, scade: st.accesso.scade };
 
-  const corpo = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: rinnovo, client_id: id, client_secret: segreto });
-  const r = await chiama('https://api.netatmo.com/oauth2/token', {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: corpo.toString() });
-  if (!r.ok) throw new Error('Netatmo non rinnova il gettone: HTTP ' + r.status + ' ' + (await r.text()).slice(0, 200));
-  const j = await r.json();
-  if (!j.access_token) throw new Error('risposta senza access_token');
-  /* Netatmo può restituire un refresh token NUOVO e invalidare il vecchio:
-     va conservato subito, altrimenti al giro dopo si resta chiusi fuori */
-  if (j.refresh_token && j.refresh_token !== rinnovo) {
-    fs.mkdirSync(path.dirname(fileStato), { recursive: true });
-    fs.writeFileSync(fileStato, cifra(j.refresh_token, segreto));
-  } else if (!fs.existsSync(fileStato)) {
-    fs.mkdirSync(path.dirname(fileStato), { recursive: true });
-    fs.writeFileSync(fileStato, cifra(rinnovo, segreto));
+  /* prima il gettone salvato; il segreto NETATMO_REFRESH_TOKEN solo se quello manca, non si
+     decifra o Netatmo lo RIFIUTA (non per un 403 di una pagina HTML, un 5xx o la rete: lì il
+     gettone non c'entra, e un gettone vecchio mandato per niente non serve a nessuno) */
+  const riserva = amb.NETATMO_REFRESH_TOKEN || null;
+  const prove = [];
+  if (st.rinnovo) prove.push({ rinnovo: st.rinnovo, da: 'stato/netatmo.enc' });
+  else if (st.rinnovoGuasto) registro.log('  ⚠ stato/netatmo.enc non si decifra: uso il segreto NETATMO_REFRESH_TOKEN');
+  if (riserva && riserva !== st.rinnovo) prove.push({ rinnovo: riserva, da: 'NETATMO_REFRESH_TOKEN' });
+  if (!prove.length) throw new Error('manca il refresh token (NETATMO_REFRESH_TOKEN, o stato/netatmo.enc)');
+
+  const segreti = [id, segreto, riserva, st.rinnovo];
+  const respinti = [];
+  for (let i = 0; i < prove.length; i++) {
+    const p = prove[i];
+    const corpo = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: p.rinnovo, client_id: id, client_secret: segreto });
+    const r = await chiama('https://api.netatmo.com/oauth2/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: corpo.toString() });
+    if (!r.ok) {
+      const testo = await r.text().catch(() => '');
+      const motivo = 'HTTP ' + r.status + ' ' + riassumiRisposta(testo, segreti);
+      if (!gettoneRespinto(r.status, testo)) throw new Error('Netatmo non rinnova il gettone: ' + motivo);
+      respinti.push(p.da);
+      if (i + 1 < prove.length) { registro.log('  ⚠ Netatmo rifiuta il gettone di ' + p.da + ' (' + motivo + '): provo ' + prove[i + 1].da); continue; }
+      const chi = respinti.length > 1 ? 'rifiutati sia stato/netatmo.enc sia NETATMO_REFRESH_TOKEN'
+                : p.da === 'NETATMO_REFRESH_TOKEN' ? 'rifiutato NETATMO_REFRESH_TOKEN'
+                : riserva ? 'rifiutato stato/netatmo.enc (NETATMO_REFRESH_TOKEN è lo stesso)'
+                : 'rifiutato stato/netatmo.enc, e non c\'è NETATMO_REFRESH_TOKEN di riserva';
+      throw new Error('Netatmo non rinnova il gettone: ' + motivo + ' — ' + chi + ': serve un gettone nuovo nei Secrets');
+    }
+    const j = await r.json();
+    if (!j.access_token) throw new Error('risposta senza access_token');
+    const durata = Number(j.expires_in) > 0 ? Number(j.expires_in) : ACCESSO_DURATA_S;
+    const scade = adesso + durata * 1000;
+    fs.mkdirSync(dir(radice, 'stato'), { recursive: true });
+    fs.writeFileSync(dir(radice, ...FILE_ACCESSO), cifra(JSON.stringify({ a: j.access_token, scade }), segreto));
+    /* Netatmo può restituire un gettone di rinnovo NUOVO e invalidare il vecchio: si salva,
+       e si fa pubblicare SUBITO, altrimenti un giro interrotto lo perde e si resta chiusi fuori.
+       Si risalva anche quando è cambiato perché si è usato il segreto (file mancante o guasto). */
+    const nuovo = j.refresh_token || p.rinnovo;
+    let nuovoRinnovo = false;
+    if (nuovo !== st.rinnovo) {
+      fs.writeFileSync(dir(radice, ...FILE_RINNOVO), cifra(nuovo, segreto));
+      nuovoRinnovo = true;
+      if (alSalvataggio) await alSalvataggio();
+    }
+    return { tok: j.access_token, fonte: p.da === 'NETATMO_REFRESH_TOKEN' ? 'segreto' : 'rinnovato', nuovoRinnovo, scade };
   }
-  return j.access_token;
+}
+
+/** Nome vecchio, tenuto per chi lo importa: solo il gettone d'accesso. */
+export async function gettone(amb, radice, chiama, opzioni) {
+  return (await assicuraGettone(amb, radice, chiama, opzioni)).tok;
+}
+
+function descriviGettone(g) {
+  if (g.fonte === 'salvato') return '  ✔ gettone d\'accesso ancora valido fino alle ' + oraItaliana(g.scade) + ': nessun rinnovo';
+  return '  ✔ gettone Netatmo rinnovato' + (g.fonte === 'segreto' ? ' con NETATMO_REFRESH_TOKEN' : '')
+       + (g.nuovoRinnovo ? ' (gettone di rinnovo nuovo salvato)' : '');
 }
 
 /* ————————————————— Netatmo: le stazioni ————————————————— */
@@ -282,7 +410,7 @@ async function mattonella(tok, m, chiama, pausa = attendi) {
     }
     if (r.status === 429 || r.status === 403 || r.status === 401) {
       const e = new Error(r.status === 429 ? 'Netatmo: troppe richieste (429)' : 'Netatmo: accesso negato (' + r.status + ')');
-      e.stop = true; e.tentativi = tentativo; throw e;
+      e.stop = true; e.status = r.status; e.tentativi = tentativo; throw e;
     }
     if (r.ok) {
       const j = await r.json();
@@ -322,8 +450,11 @@ export const mattonelleDiPartenza = () => {
 /** Tutte le stazioni d'Italia, a mattonelle adattive e con un tetto di chiamate.
  *  L'albero delle mattonelle vive in mattonelle.json: le spezzate non si
  *  richiedono (si scende ai figli), le vuote si saltano per un giorno, quelle
- *  che non toccano l'Italia non si guardano nemmeno. */
-export async function raccogli(tok, radice, chiama, adesso = Date.now(), registro = console, pausa = attendi) {
+ *  che non toccano l'Italia non si guardano nemmeno. Il tetto si può passare
+ *  più basso (ponte 3.4: quando si riparte con un gettone nuovo, quello che
+ *  resta del giro), mai più alto. */
+export async function raccogli(tok, radice, chiama, adesso = Date.now(), registro = console, pausa = attendi, tetto = TETTO_CHIAMATE) {
+  tetto = Math.min(tetto, TETTO_CHIAMATE);
   const fileMatt = dir(radice, 'mattonelle.json');
   let memoria = leggi(fileMatt, {});
   if (!memoria || memoria._versione !== VERSIONE_MEMORIA) memoria = { _versione: VERSIONE_MEMORIA };
@@ -340,18 +471,18 @@ export async function raccogli(tok, radice, chiama, adesso = Date.now(), registr
 
   const stazioni = new Map();
   const mattonelleFallite = [];
-  let chiamate = 0, spezzate = 0, saltate = 0, ritentate = 0, fallite = 0;
+  let chiamate = 0, spezzate = 0, saltate = 0, ritentate = 0, fallite = 0, fermato = 0, fermatoMsg = '';
   while (coda.length) {
     const m = coda.shift();
     const k = chiaveM(m);
     const nota = memoria[k];
     if (nota && nota.dentro === 0 && adesso - nota.ts < VUOTA_VALIDA_MS) { saltate++; continue; }   /* mare, o montagna deserta */
-    if (chiamate >= TETTO_CHIAMATE) { registro.log('  · tetto di ' + TETTO_CHIAMATE + ' chiamate raggiunto: il resto al prossimo giro'); break; }
+    if (chiamate >= tetto) { registro.log('  · tetto di ' + tetto + ' chiamate raggiunto: il resto al prossimo giro'); break; }
     let esito;
     try { esito = await mattonella(tok, m, chiama, pausa); }
     catch (e) {
       chiamate += e.tentativi || 1;
-      if (e.stop) { mattonelleFallite.push(m); registro.log('  ✘ ' + e.message + ': mi fermo qui'); break; }
+      if (e.stop) { mattonelleFallite.push(m); fermato = e.status || 0; fermatoMsg = e.message; registro.log('  ✘ ' + e.message + ': mi fermo qui'); break; }
       fallite++;
       mattonelleFallite.push(m);
       registro.log('  ⚠ ' + k + ': ' + e.message + (e.tentativi > 1 ? ' (dopo ' + e.tentativi + ' tentativi)' : ''));
@@ -381,7 +512,7 @@ export async function raccogli(tok, radice, chiama, adesso = Date.now(), registr
   /* chi è rimasto in coda per il tetto o per lo stop non è stato letto: vale come fallito,
      così le sue letture del giro prima vengono riportate */
   for (const m of coda) mattonelleFallite.push(m);
-  return { stazioni: [...stazioni.values()], chiamate, spezzate, saltate, fuori, ritentate, fallite, mattonelleFallite };
+  return { stazioni: [...stazioni.values()], chiamate, spezzate, saltate, fuori, ritentate, fallite, mattonelleFallite, fermato, fermatoMsg };
 }
 
 /* ————————————————— il riporto delle letture del giro prima ————————————————— */
@@ -848,13 +979,29 @@ export function scriviTutto(radice, stazioni, aerop, meta, adesso = Date.now()) 
 
 /* ————————————————— il giro completo ————————————————— */
 
-export async function giro(amb = process.env, radice = process.cwd(), chiama = fetch, registro = console, pausa = attendi) {
+export async function giro(amb = process.env, radice = process.cwd(), chiama = fetch, registro = console, pausa = attendi, alSalvataggio = null) {
   const t0 = Date.now();
   registro.log('Ponte stazioni · ' + new Date().toISOString());
-  const tok = await gettone(amb, radice, chiama);
-  registro.log('  ✔ gettone Netatmo rinnovato');
+  let g = await assicuraGettone(amb, radice, chiama, { registro, alSalvataggio });
+  registro.log(descriviGettone(g));
   const precedenti = lettureprecedenti(radice);          /* prima che scriviTutto le cancelli */
-  const r = await raccogli(tok, radice, chiama, Date.now(), registro, pausa);
+  let r = await raccogli(g.tok, radice, chiama, Date.now(), registro, pausa);
+  if (g.fonte === 'salvato' && (r.fermato === 401 || r.fermato === 403) && !r.stazioni.length) {
+    /* ponte 3.4 · il gettone d'accesso salvato non vale più prima del tempo: si rinnova
+       una volta e si riparte, con le chiamate che restano (il tetto del giro non cambia) */
+    registro.log('  ↻ Netatmo non accetta più il gettone d\'accesso salvato: lo rinnovo e riparto');
+    try {
+      g = await assicuraGettone(amb, radice, chiama, { registro, alSalvataggio, forza: true });
+      registro.log(descriviGettone(g));
+      const r2 = await raccogli(g.tok, radice, chiama, Date.now(), registro, pausa, TETTO_CHIAMATE - r.chiamate);
+      r2.chiamate += r.chiamate;
+      r = r2;
+    } catch (e) {
+      /* come prima del ponte 3.4: il giro finisce con le letture riportate, e l'allarme lo sa */
+      registro.log('  ⚠ ' + e.message + ': il giro va avanti con le letture riportate');
+      r.fermatoMsg = e.message;
+    }
+  }
   registro.log('  ✔ Netatmo: ' + r.stazioni.length + ' stazioni con ' + r.chiamate + ' chiamate (' + r.spezzate + ' mattonelle spezzate, '
              + r.saltate + ' saltate perché vuote, ' + r.fuori + ' fuori dall\'Italia, ' + r.ritentate + ' ritentate, ' + r.fallite + ' fallite)');
   const riportate = riporta(r.stazioni, precedenti);
@@ -882,7 +1029,9 @@ export async function giro(amb = process.env, radice = process.cwd(), chiama = f
   } catch (e) { registro.log('  ⚠ reputazione: ' + e.message + ' (i dati delle stazioni non ne risentono)'); }
   const conteggi = scriviTutto(radice, r.stazioni, a, { chiamate: r.chiamate, durataMs: Date.now() - t0, reputazione: rep.imparate });
   registro.log('  ✔ scritte ' + Object.keys(conteggi).length + ' celle in ' + Math.round((Date.now() - t0) / 1000) + ' s');
-  return { stazioni: r.stazioni.length, aeroporti: a.length, celle: Object.keys(conteggi).length, chiamate: r.chiamate, imparate: rep.imparate };
+  const fatto = { stazioni: r.stazioni.length, aeroporti: a.length, celle: Object.keys(conteggi).length, chiamate: r.chiamate, imparate: rep.imparate };
+  if (r.fermatoMsg) fatto.fermato = r.fermatoMsg;      /* il giro è andato, ma Netatmo l'ha fermato a metà: lo sa anche l'allarme */
+  return fatto;
 }
 
 export function stessoFile(indirizzoModulo, lanciato, piattaforma = process.platform) {
@@ -895,6 +1044,15 @@ export function stessoFile(indirizzoModulo, lanciato, piattaforma = process.plat
 }
 
 if (stessoFile(import.meta.url, process.argv[1])) {
-  giro().then(r => { console.log('Fatto:', JSON.stringify(r)); })
-        .catch(e => { console.log('✘ ' + e.message); process.exit(1); });
+  const segreti = [process.env.NETATMO_CLIENT_ID, process.env.NETATMO_CLIENT_SECRET, process.env.NETATMO_REFRESH_TOKEN];
+  /* ponte 3.4 · l'ultima riga d'errore, senza segreti, per l'allarme di fine lavoro */
+  const annota = riga => { if (process.env.PONTE_ERRORE) try { fs.appendFileSync(process.env.PONTE_ERRORE, senzaSegreti(riga, segreti) + '\n'); } catch (_) {} };
+  /* ponte 3.4 · un gettone di rinnovo nuovo si pubblica SUBITO, prima di raccogliere */
+  const pubblicaSubito = process.env.PONTE_PUBBLICA ? () => {
+    try { execFileSync('bash', [process.env.PONTE_PUBBLICA], { stdio: 'inherit' }); }
+    catch (e) { console.log('  ⚠ il gettone nuovo non è stato pubblicato subito (' + senzaSegreti(e.message, segreti) + '): ci pensa la pubblicazione di fine giro'); }
+  } : null;
+  giro(process.env, process.cwd(), fetch, console, attendi, pubblicaSubito)
+    .then(r => { if (r.fermato) annota('⚠ ' + r.fermato + ' (giro finito con le letture riportate)'); console.log('Fatto:', JSON.stringify(r)); })
+    .catch(e => { const riga = '✘ ' + senzaSegreti(e.message, segreti); console.log(riga); annota(riga); process.exit(1); });
 }
